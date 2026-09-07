@@ -95,7 +95,11 @@ class DeviceRecord(BaseModel):
 
 
 class SessionRecord(BaseModel):
-    """Exclusive lease that binds one agent to one device."""
+    """Exclusive lease that binds one agent to one device.
+
+    `secret` is a capability token issued at start. List/get responses must
+    omit it; only start/attach return it to the caller that created the lease.
+    """
 
     id: str
     device_id: str
@@ -105,6 +109,30 @@ class SessionRecord(BaseModel):
     last_action_at: datetime | None = None
     released_at: datetime | None = None
     metadata: dict[str, str] = Field(default_factory=dict)
+    secret: str = ""
+
+    def public_dump(self) -> dict[str, Any]:
+        """JSON-ready dict without the capability secret."""
+        return self.model_dump(mode="json", exclude={"secret"})
+
+
+class SessionPublic(BaseModel):
+    """Session fields safe to list or GET (no capability secret)."""
+
+    id: str
+    device_id: str
+    agent_label: str = "anonymous"
+    status: SessionStatus = SessionStatus.ACTIVE
+    created_at: datetime
+    last_action_at: datetime | None = None
+    released_at: datetime | None = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class SessionGrant(SessionPublic):
+    """Start/attach response: includes the capability secret once."""
+
+    secret: str
 
 
 class ActionName(str, Enum):

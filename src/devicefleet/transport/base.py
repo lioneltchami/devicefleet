@@ -39,11 +39,14 @@ class FleetTransport(Protocol):
         self,
         device_id: str | None = None,
         tags: list[str] | None = None,
-        agent_label: str = "anonymous",
+        agent_label: str | None = None,
     ) -> SessionRecord: ...
 
     def attach_session(
-        self, session_id: str, agent_label: str | None = None
+        self,
+        session_id: str,
+        agent_label: str | None = None,
+        session_secret: str | None = None,
     ) -> SessionRecord: ...
 
     def list_sessions(self, active_only: bool = False) -> list[SessionRecord]: ...

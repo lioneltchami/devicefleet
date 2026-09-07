@@ -7,7 +7,8 @@ from typing import Any
 
 import httpx
 
-from devicefleet.auth import AGENT_HEADER, TOKEN_HEADER
+from devicefleet.auth import AGENT_HEADER, SESSION_HEADER, TOKEN_HEADER
+from devicefleet.store import YamlStore
 from devicefleet.models import (
     ActionRequest,
     ActionResult,
@@ -29,6 +30,8 @@ class HttpTransport:
         agent_label: str = "anonymous",
         timeout_s: float = 60.0,
         artifacts_dir: Path | None = None,
+        secret_store: YamlStore | None = None,
+        session_secret: str | None = None,
     ) -> None:
         if not base_url or not base_url.strip():
             raise ValueError("base_url is required")
@@ -37,6 +40,9 @@ class HttpTransport:
         self.agent_label = agent_label.strip() or "anonymous"
         self.timeout_s = timeout_s
         self.artifacts_dir = artifacts_dir
+        self.secret_store = secret_store
+        self.session_secrets: dict[str, str] = {}
+        self.default_secret = session_secret.strip() if session_secret else None
 
     def discover(self, save: bool = False) -> list[DiscoveredDevice]:
         data = self._request("POST", "/devices/discover", json={"save": save})
@@ -76,26 +82,36 @@ class HttpTransport:
         self,
         device_id: str | None = None,
         tags: list[str] | None = None,
-        agent_label: str = "anonymous",
+        agent_label: str | None = None,
     ) -> SessionRecord:
         payload = {
             "device_id": device_id,
             "tags": tags or [],
-            "agent_label": agent_label,
+            "agent_label": agent_label or self.agent_label,
         }
         data = self._request("POST", "/sessions", json=payload)
-        return SessionRecord.model_validate(data)
+        session = SessionRecord.model_validate(data)
+        self._remember_secret(session.id, session.secret)
+        return session
 
     def attach_session(
-        self, session_id: str, agent_label: str | None = None
+        self,
+        session_id: str,
+        agent_label: str | None = None,
+        session_secret: str | None = None,
     ) -> SessionRecord:
         label = agent_label or self.agent_label
+        if session_secret:
+            self._remember_secret(session_id, session_secret)
         data = self._request(
             "POST",
             f"/sessions/{session_id}/attach",
             json={"agent_label": label},
+            session_id=session_id,
         )
-        return SessionRecord.model_validate(data)
+        session = SessionRecord.model_validate(data)
+        self._remember_secret(session.id, session.secret)
+        return session
 
     def list_sessions(self, active_only: bool = False) -> list[SessionRecord]:
         data = self._request(
@@ -106,7 +122,7 @@ class HttpTransport:
         return [SessionRecord.model_validate(item) for item in data]
 
     def stop_session(self, session_id: str) -> SessionRecord:
-        data = self._request("DELETE", f"/sessions/{session_id}")
+        data = self._request("DELETE", f"/sessions/{session_id}", session_id=session_id)
         return SessionRecord.model_validate(data)
 
     def run(self, session_id: str, request: ActionRequest) -> ActionResult:
@@ -114,6 +130,7 @@ class HttpTransport:
             "POST",
             f"/sessions/{session_id}/actions",
             json=request.model_dump(mode="json"),
+            session_id=session_id,
         )
         result = ActionResult.model_validate(data)
         if result.artifact_path and self.artifacts_dir is not None:
@@ -127,7 +144,9 @@ class HttpTransport:
         return result
 
     def _download_artifact(self, session_id: str, name: str) -> Path:
-        raw = self._request_bytes("GET", f"/sessions/{session_id}/artifacts/{name}")
+        raw = self._request_bytes(
+            "GET", f"/sessions/{session_id}/artifacts/{name}", session_id=session_id
+        )
         folder = self.artifacts_dir / session_id if self.artifacts_dir else Path(session_id)
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / name
@@ -138,11 +157,41 @@ class HttpTransport:
         """Remote agents must pass --session; the host has no shared current."""
         return None
 
-    def _headers(self) -> dict[str, str]:
+    def _remember_secret(self, session_id: str, secret: str) -> None:
+        if not session_id or not secret:
+            return
+        self.session_secrets[session_id] = secret
+        if self.secret_store is None:
+            return
+
+        def mutator(document: dict[str, object]) -> None:
+            mapping = document.get("session_secrets")
+            merged: dict[str, object] = dict(mapping) if isinstance(mapping, dict) else {}
+            merged[session_id] = secret
+            document["session_secrets"] = merged
+
+        self.secret_store.update(mutator)
+
+    def _secret_for(self, session_id: str | None) -> str | None:
+        if session_id and session_id in self.session_secrets:
+            return self.session_secrets[session_id]
+        if session_id and self.secret_store is not None:
+            mapping = self.secret_store.load().get("session_secrets")
+            if isinstance(mapping, dict):
+                value = mapping.get(session_id)
+                if isinstance(value, str) and value:
+                    self.session_secrets[session_id] = value
+                    return value
+        return self.default_secret
+
+    def _headers(self, session_id: str | None = None) -> dict[str, str]:
         headers = {AGENT_HEADER: self.agent_label}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
             headers[TOKEN_HEADER] = self.token
+        secret = self._secret_for(session_id)
+        if secret:
+            headers[SESSION_HEADER] = secret
         return headers
 
     def _request(
@@ -151,21 +200,30 @@ class HttpTransport:
         path: str,
         json: dict[str, Any] | None = None,
         params: dict[str, str] | None = None,
+        session_id: str | None = None,
     ) -> Any:
         url = f"{self.base_url}{path}"
         with httpx.Client(timeout=self.timeout_s) as client:
             response = client.request(
-                method, url, json=json, params=params, headers=self._headers()
+                method,
+                url,
+                json=json,
+                params=params,
+                headers=self._headers(session_id),
             )
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise RuntimeError(f"fleet host {method} {path} failed: {detail}")
         return response.json()
 
-    def _request_bytes(self, method: str, path: str) -> bytes:
+    def _request_bytes(
+        self, method: str, path: str, session_id: str | None = None
+    ) -> bytes:
         url = f"{self.base_url}{path}"
         with httpx.Client(timeout=self.timeout_s) as client:
-            response = client.request(method, url, headers=self._headers())
+            response = client.request(
+                method, url, headers=self._headers(session_id)
+            )
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise RuntimeError(f"fleet host {method} {path} failed: {detail}")

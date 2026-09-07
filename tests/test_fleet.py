@@ -14,19 +14,32 @@ from devicefleet.sessions import DeviceBusyError, SessionError
 
 def test_stub_session_helpers_without_hardware(fleet: Fleet) -> None:
     session = fleet.start_session(device_id="stub-demo", agent_label="pytest")
-    shot = fleet.run(session.id, ActionRequest(name=ActionName.SCREENSHOT))
+    secret = session.secret
+    shot = fleet.run(
+        session.id, ActionRequest(name=ActionName.SCREENSHOT), session_secret=secret
+    )
     assert shot.ok
     assert shot.artifact_path
     assert shot.artifact_path.endswith("screenshot.png")
 
-    tap = fleet.run(session.id, ActionRequest(name=ActionName.TAP, x=540, y=960))
+    tap = fleet.run(
+        session.id,
+        ActionRequest(name=ActionName.TAP, x=540, y=960),
+        session_secret=secret,
+    )
     assert tap.ok
-    typed = fleet.run(session.id, ActionRequest(name=ActionName.TYPE, text="fleet"))
+    typed = fleet.run(
+        session.id,
+        ActionRequest(name=ActionName.TYPE, text="fleet"),
+        session_secret=secret,
+    )
     assert typed.ok
-    dump = fleet.run(session.id, ActionRequest(name=ActionName.DUMP_UI))
+    dump = fleet.run(
+        session.id, ActionRequest(name=ActionName.DUMP_UI), session_secret=secret
+    )
     assert "<hierarchy" in str(dump.payload.get("xml"))
 
-    stopped = fleet.stop_session(session.id)
+    stopped = fleet.stop_session(session.id, session_secret=secret)
     assert stopped.status.value == "released"
 
 
@@ -70,7 +83,9 @@ def test_unattached_adb_device_lists_offline(fleet: Fleet) -> None:
 def test_stop_releases_when_registry_row_is_gone(fleet: Fleet) -> None:
     session = fleet.start_session(device_id="stub-demo", agent_label="ghost")
     fleet.registry.remove("stub-demo")
-    stopped = fleet.stop_session(session.id, agent_label="ghost")
+    stopped = fleet.stop_session(
+        session.id, agent_label="ghost", session_secret=session.secret
+    )
     assert stopped.status.value == "released"
 
 
@@ -95,13 +110,13 @@ def test_stopped_provisioned_stub_is_not_leaseable(fleet: Fleet) -> None:
     extra = fleet.provision_stub()
     extra_id = extra.id
     session = fleet.start_session(device_id=extra_id, agent_label="temp")
-    fleet.stop_session(session.id, agent_label="temp")
+    fleet.stop_session(session.id, agent_label="temp", session_secret=session.secret)
     with pytest.raises((DeviceNotFoundError, FleetError)):
         fleet.start_session(device_id=extra_id, agent_label="again")
     ids = {item.device.id for item in fleet.list_devices()}
     assert extra_id not in ids
     demo = fleet.start_session(device_id="stub-demo", agent_label="demo")
-    fleet.stop_session(demo.id, agent_label="demo")
+    fleet.stop_session(demo.id, agent_label="demo", session_secret=demo.secret)
     again = fleet.start_session(device_id="stub-demo", agent_label="demo-2")
     assert again.device_id == "stub-demo"
 
@@ -166,9 +181,14 @@ def test_concurrent_start_session_single_lease(fleet: Fleet) -> None:
 
 def test_run_after_stop_cannot_fire(fleet: Fleet) -> None:
     session = fleet.start_session(device_id="stub-demo", agent_label="racer")
-    fleet.stop_session(session.id, agent_label="racer")
+    fleet.stop_session(session.id, agent_label="racer", session_secret=session.secret)
     with pytest.raises(SessionError):
-        fleet.run(session.id, ActionRequest(name=ActionName.INFO), agent_label="racer")
+        fleet.run(
+            session.id,
+            ActionRequest(name=ActionName.INFO),
+            agent_label="racer",
+            session_secret=session.secret,
+        )
 
 
 def test_run_and_stop_serialized(fleet: Fleet) -> None:
@@ -189,6 +209,7 @@ def test_run_and_stop_serialized(fleet: Fleet) -> None:
                 session.id,
                 ActionRequest(name=ActionName.SCREENSHOT),
                 agent_label="lock",
+                session_secret=session.secret,
             )
             results.append("ran")
         except SessionError:
@@ -200,9 +221,58 @@ def test_run_and_stop_serialized(fleet: Fleet) -> None:
     threading.Event().wait(0.05)
     gate.set()
     thread.join(timeout=3)
-    stopped = fleet.stop_session(session.id, agent_label="lock")
+    stopped = fleet.stop_session(
+        session.id, agent_label="lock", session_secret=session.secret
+    )
     assert stopped.status.value == "released"
     assert "ran" in results or "run-failed" in results
     if "ran" in results:
         # Action completed under the lock before stop released the lease.
         assert fleet.sessions.get(session.id).status.value == "released"
+
+
+def test_provision_does_not_overwrite_non_stub(fleet: Fleet) -> None:
+    fleet.register_device(
+        device_id="stub-phone-2",
+        provider=ProviderKind.ADB,
+        provider_ref="SERIAL-REAL",
+        display_name="Real Phone",
+    )
+    extra = fleet.provision_stub()
+    assert extra.id != "stub-phone-2"
+    assert extra.provider_ref != "stub-phone-2"
+    assert extra.provider_ref != "SERIAL-REAL"
+    kept = fleet.registry.get("stub-phone-2")
+    assert kept.provider is ProviderKind.ADB
+    assert kept.display_name == "Real Phone"
+
+
+def test_remove_and_start_do_not_orphan_session(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    errors: list[BaseException] = []
+    started: list[str] = []
+
+    def remover() -> None:
+        try:
+            fleet.remove_device(extra.id)
+        except (DeviceInUseError, DeviceNotFoundError) as exc:
+            errors.append(exc)
+
+    def starter() -> None:
+        try:
+            session = fleet.start_session(device_id=extra.id, agent_label="racer")
+            started.append(session.id)
+        except (DeviceNotFoundError, FleetError) as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=starter), threading.Thread(target=remover)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if started:
+        session = fleet.sessions.get(started[0])
+        assert fleet.registry.get(session.device_id).id == extra.id
+    else:
+        with pytest.raises(DeviceNotFoundError):
+            fleet.registry.get(extra.id)

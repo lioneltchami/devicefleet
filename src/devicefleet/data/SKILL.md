@@ -25,13 +25,16 @@ If `adb` is missing, do **not** block. Use `--device stub-demo` for demos and te
 Always take a session before you touch a phone. Always release it when you are done.
 
 ```bash
+export DEVICEFLEET_AGENT=<your-name>   # same label on start, run, and stop
 devicefleet devices list
-devicefleet session start --device stub-demo --agent <your-name>
+devicefleet session start --device stub-demo
 devicefleet run screenshot
 devicefleet run dump-ui
 # tap / swipe / type / key as needed
 devicefleet session stop
 ```
+
+Or pass `--agent <your-name>` on **every** command (`devicefleet --agent coder run screenshot`). A start-only `--agent` does not carry into a later process.
 
 Useful selectors:
 
@@ -44,7 +47,7 @@ devicefleet session list --active
 
 `--tag` is AND. If every matching device is busy, start fails — pick another tag or wait. Do not “just run adb” on a device that already has a session.
 
-Locally, the CLI remembers **your** current session, keyed by `--agent` / `DEVICEFLEET_AGENT`. Another agent in the same data dir will not pick it up. `DEVICEFLEET_CURRENT_SESSION` overrides that memory for this process only. On `--remote`, always pass `--session` (there is no shared current session). Attach requires the same agent label that started the lease.
+Locally, the CLI remembers **your** current session, keyed by `--agent` / `DEVICEFLEET_AGENT`. Another agent in the same data dir will not pick it up. `DEVICEFLEET_CURRENT_SESSION` overrides that memory for this process only. On `--remote`, always pass `--session` (there is no shared current session). Attach/run/stop on a remote host require the session secret returned at start (`X-Devicefleet-Session`); the CLI stores it under `$DEVICEFLEET_HOME`. Knowing another agent's label is not enough.
 
 ## Helpers
 

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     token: str | None = None
     agent: str = "anonymous"
     current_session: str | None = None
+    session_secret: str | None = None
 
     @property
     def devices_path(self) -> Path:

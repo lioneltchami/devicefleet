@@ -89,7 +89,10 @@ def test_skill_mentions_sessions() -> None:
     result = runner.invoke(app, ["skill"])
     assert "session start" in result.stdout
     assert "DEVICEFLEET_CURRENT_SESSION" in result.stdout
-    assert "DEVICEFLEET_SESSION" not in result.stdout.replace("DEVICEFLEET_CURRENT_SESSION", "")
+    scrubbed = result.stdout.replace("DEVICEFLEET_CURRENT_SESSION", "").replace(
+        "DEVICEFLEET_SESSION_SECRET", ""
+    )
+    assert "DEVICEFLEET_SESSION" not in scrubbed
     assert "downloads those files" in result.stdout
 
 

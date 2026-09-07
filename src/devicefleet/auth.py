@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 
 TOKEN_HEADER = "X-Devicefleet-Token"
 AGENT_HEADER = "X-Devicefleet-Agent"
+SESSION_HEADER = "X-Devicefleet-Session"
 
 
 def extract_bearer_or_header(request: Request) -> str | None:
@@ -41,12 +42,28 @@ def require_fleet_token(request: Request) -> None:
 
 
 def agent_from_headers(request: Request, fallback: str | None = None) -> str:
-    """Agent identity for attach/stop/action ownership checks."""
+    """Agent label from `X-Devicefleet-Agent` (display / current-session key)."""
     header = request.headers.get(AGENT_HEADER)
     if header and header.strip():
         return header.strip()
     label = (fallback or "anonymous").strip()
     return label or "anonymous"
+
+
+def agent_header_optional(request: Request) -> str | None:
+    """Explicit agent header, or None when the caller omitted it."""
+    header = request.headers.get(AGENT_HEADER)
+    if header and header.strip():
+        return header.strip()
+    return None
+
+
+def session_secret_from_headers(request: Request) -> str | None:
+    """Capability token issued at session start (`X-Devicefleet-Session`)."""
+    header = request.headers.get(SESSION_HEADER)
+    if header and header.strip():
+        return header.strip()
+    return None
 
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})

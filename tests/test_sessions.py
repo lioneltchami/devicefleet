@@ -34,12 +34,17 @@ def test_exclusive_lease(tmp_path: Path) -> None:
 def test_attach_and_missing(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     session = manager.start("stub-demo", agent_label="coder")
-    attached = manager.attach(session.id, agent_label="coder")
+    assert session.secret.startswith("cap_")
+    attached = manager.attach(
+        session.id, agent_label="coder", session_secret=session.secret
+    )
     assert attached.id == session.id
     with pytest.raises(SessionOwnershipError):
-        manager.attach(session.id, agent_label="coder-2")
+        manager.attach(session.id, agent_label="coder-2", session_secret=session.secret)
     with pytest.raises(SessionOwnershipError):
-        manager.attach(session.id, agent_label=None)
+        manager.attach(session.id, agent_label="coder")
+    with pytest.raises(SessionOwnershipError):
+        manager.attach(session.id, agent_label="coder", session_secret="cap_wrong")
     with pytest.raises(SessionNotFoundError):
         manager.get("ses_missing")
 

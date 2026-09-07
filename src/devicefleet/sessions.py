@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import secrets
 from datetime import datetime
 
@@ -88,6 +89,7 @@ class SessionManager:
                 device_id=device_id,
                 agent_label=agent_label.strip() or "anonymous",
                 metadata=metadata or {},
+                secret=_new_session_secret(),
             )
             sessions.append(session)
             document.clear()
@@ -96,24 +98,36 @@ class SessionManager:
 
         return self._store.update(mutator)
 
-    def attach(self, session_id: str, agent_label: str | None = None) -> SessionRecord:
-        """Rejoin an existing active session. The agent label must match the owner."""
-        session = self.get(session_id)
-        if session.status != SessionStatus.ACTIVE:
-            raise SessionError(f"session {session_id} is not active")
+    def attach(
+        self,
+        session_id: str,
+        agent_label: str | None = None,
+        session_secret: str | None = None,
+    ) -> SessionRecord:
+        """Rejoin an existing active session. Requires the capability secret."""
+        session = self.require_secret(session_id, session_secret)
         caller = (agent_label or "").strip()
-        if not caller:
-            raise SessionOwnershipError(
-                "agent_label is required to attach; a session id alone is not enough"
-            )
-        if caller != session.agent_label:
+        if caller and caller != session.agent_label:
             raise SessionOwnershipError(
                 f"session {session_id} belongs to {session.agent_label}, not {caller}"
             )
         return session
 
+    def require_secret(
+        self, session_id: str, session_secret: str | None
+    ) -> SessionRecord:
+        """Return the session only if it is active and the secret matches."""
+        session = self.get(session_id)
+        if session.status != SessionStatus.ACTIVE:
+            raise SessionError(f"session {session_id} is not active")
+        _check_secret(session, session_secret)
+        return session
+
     def require_owner(self, session_id: str, agent_label: str | None) -> SessionRecord:
-        """Return the session only if it is active and owned by this agent."""
+        """Return the session only if it is active and owned by this agent.
+
+        Prefer `require_secret` for HTTP: agent_label is caller-controlled.
+        """
         session = self.get(session_id)
         if session.status != SessionStatus.ACTIVE:
             raise SessionError(f"session {session_id} is not active")
@@ -178,3 +192,19 @@ class SessionManager:
 
 def _new_session_id() -> str:
     return "ses_" + secrets.token_hex(6)
+
+
+def _new_session_secret() -> str:
+    return "cap_" + secrets.token_urlsafe(24)
+
+
+def _check_secret(session: SessionRecord, presented: str | None) -> None:
+    expected = session.secret or ""
+    got = (presented or "").strip()
+    if not expected or not got:
+        raise SessionOwnershipError(
+            "session secret is required; it is returned at start/attach "
+            "and sent as X-Devicefleet-Session"
+        )
+    if not hmac.compare_digest(expected, got):
+        raise SessionOwnershipError("invalid session secret")

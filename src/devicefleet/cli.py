@@ -19,6 +19,7 @@ from devicefleet.models import ActionName, ActionRequest, DeviceListItem, Provid
 from devicefleet.registry import DeviceNotFoundError
 from devicefleet.sessions import DeviceBusyError, SessionOwnershipError
 from devicefleet.skilltext import load_skill_markdown
+from devicefleet.store import YamlStore
 from devicefleet.transport.http import HttpTransport
 from devicefleet.transport.local import LocalTransport
 
@@ -64,6 +65,8 @@ def _transport(ctx: typer.Context) -> LocalTransport | HttpTransport:
             token=token,
             agent_label=agent,
             artifacts_dir=settings.artifacts_dir,
+            secret_store=YamlStore(settings.state_path),
+            session_secret=settings.session_secret,
         )
     else:
         transport = LocalTransport(_fleet(ctx), agent_label=agent)
@@ -332,7 +335,7 @@ def session_list(
     """Show sessions."""
     sessions = _transport(ctx).list_sessions(active_only=active)
     if as_json:
-        _emit([item.model_dump(mode="json") for item in sessions], True)
+        _emit([item.public_dump() for item in sessions], True)
         return
     _print_sessions(sessions)
 

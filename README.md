@@ -44,9 +44,10 @@ You do **not** need `adb` or a cloud account to exercise the stub path.
 ## Quick start (no phone)
 
 ```bash
+export DEVICEFLEET_AGENT=my-agent
 devicefleet doctor
 devicefleet devices list
-devicefleet session start --device stub-demo --agent my-agent
+devicefleet session start --device stub-demo
 devicefleet run screenshot
 devicefleet run tap 540 960
 devicefleet run type "hello"
@@ -105,7 +106,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the module map and extension points.
 
 Remote agents should not each spawn their own ADB daemon against the same USB bus. Run one fleet host and point clients at it.
 
-`devicefleet serve` binds **127.0.0.1** by default. Binding `0.0.0.0` (or any non-loopback address) requires an explicit `--host` **and** `DEVICEFLEET_TOKEN`. Clients send the same secret as `Authorization: Bearer …` or `X-Devicefleet-Token`. Attach/stop/action also require a matching `X-Devicefleet-Agent` so a listed session id cannot steal another agent's lease.
+`devicefleet serve` binds **127.0.0.1** by default. Binding `0.0.0.0` (or any non-loopback address) requires an explicit `--host` **and** `DEVICEFLEET_TOKEN`. Clients send the same secret as `Authorization: Bearer …` or `X-Devicefleet-Token`.
+
+`DEVICEFLEET_TOKEN` is a host-wide admin credential (list devices, start sessions). It is **not** enough to drive someone else's lease. `POST /sessions` returns a per-session capability secret; attach, stop, actions, and artifact downloads must send it as `X-Devicefleet-Session`. List/GET session responses omit the secret. `X-Devicefleet-Agent` is a label (and attach accepts it from the header if the JSON body omits `agent_label`); knowing another agent's label does not grant their lease.
 
 ```bash
 # local lab (loopback, token optional)
@@ -138,8 +141,9 @@ Prints [SKILL.md](SKILL.md). Drop that file into an agent skill slot, or tell th
 | `DEVICEFLEET_HOME` | Data directory (registry, sessions, screenshots) |
 | `DEVICEFLEET_REMOTE_URL` | Default fleet host for the CLI |
 | `DEVICEFLEET_TOKEN` | Shared secret for the HTTP host and `--remote` clients |
-| `DEVICEFLEET_AGENT` | Agent label used for session ownership and the local current-session map |
+| `DEVICEFLEET_AGENT` | Agent label for the local current-session map (pass on every command, or export) |
 | `DEVICEFLEET_CURRENT_SESSION` | Process-local session id override (does not change other agents) |
+| `DEVICEFLEET_SESSION_SECRET` | Optional capability secret for a remote attach/run/stop |
 | `DEVICEFLEET_ADB_BIN` | `adb` executable (default `adb`) |
 | `DEVICEFLEET_HOST` / `DEVICEFLEET_PORT` | Bind address for `serve` (default `127.0.0.1:8765`) |
 

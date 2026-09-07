@@ -10,6 +10,10 @@ from devicefleet.models import ActionName, ActionRequest
 from devicefleet.transport.http import HttpTransport
 
 
+def _owned(headers: dict[str, str], created: dict) -> dict[str, str]:
+    return {**headers, "X-Devicefleet-Session": created["secret"]}
+
+
 def test_health_and_session_action(fleet: Fleet) -> None:
     client = TestClient(create_app(fleet))
     health = client.get("/health")
@@ -24,11 +28,12 @@ def test_health_and_session_action(fleet: Fleet) -> None:
     )
     assert created.status_code == 200
     session_id = created.json()["id"]
+    owned = _owned(headers, created.json())
 
     shot = client.post(
         f"/sessions/{session_id}/actions",
         json={"name": ActionName.SCREENSHOT.value},
-        headers=headers,
+        headers=owned,
     )
     assert shot.status_code == 200
     assert shot.json()["ok"] is True
@@ -36,18 +41,22 @@ def test_health_and_session_action(fleet: Fleet) -> None:
     tap = client.post(
         f"/sessions/{session_id}/actions",
         json={"name": "tap", "x": 12, "y": 40},
-        headers=headers,
+        headers=owned,
     )
     assert tap.status_code == 200
 
     missing = client.post(
         "/sessions/ses_missing/actions",
         json={"name": "tap", "x": 1, "y": 1},
-        headers=headers,
+        headers=owned,
     )
     assert missing.status_code == 404
 
-    stopped = client.delete(f"/sessions/{session_id}", headers=headers)
+    listed = client.get("/sessions", headers=headers)
+    assert listed.status_code == 200
+    assert "secret" not in listed.json()[0]
+
+    stopped = client.delete(f"/sessions/{session_id}", headers=owned)
     assert stopped.status_code == 200
     assert stopped.json()["status"] == "released"
 
@@ -85,14 +94,15 @@ def test_action_on_missing_device_is_404(fleet: Fleet) -> None:
         headers=headers,
     )
     session_id = created.json()["id"]
+    owned = _owned(headers, created.json())
     fleet.registry.remove("stub-demo")
     action = client.post(
         f"/sessions/{session_id}/actions",
         json={"name": "info"},
-        headers=headers,
+        headers=owned,
     )
     assert action.status_code == 404
-    stopped = client.delete(f"/sessions/{session_id}", headers=headers)
+    stopped = client.delete(f"/sessions/{session_id}", headers=owned)
     assert stopped.status_code == 200
 
 
@@ -105,10 +115,11 @@ def test_artifact_download_and_http_transport(fleet: Fleet, tmp_path: Path) -> N
         headers=headers,
     )
     session_id = created.json()["id"]
+    owned = _owned(headers, created.json())
     shot = client.post(
         f"/sessions/{session_id}/actions",
         json={"name": ActionName.SCREENSHOT.value},
-        headers=headers,
+        headers=owned,
     )
     assert shot.status_code == 200
     name = Path(shot.json()["artifact_path"]).name
@@ -121,14 +132,14 @@ def test_artifact_download_and_http_transport(fleet: Fleet, tmp_path: Path) -> N
 
     downloaded = client.get(
         f"/sessions/{session_id}/artifacts/{name}",
-        headers=headers,
+        headers=owned,
     )
     assert downloaded.status_code == 200
     assert downloaded.content[:8] == b"\x89PNG\r\n\x1a\n"
 
     traversal = client.get(
         f"/sessions/{session_id}/artifacts/..%2Fdevices.yaml",
-        headers=headers,
+        headers=owned,
     )
     assert traversal.status_code in {400, 404}
 
@@ -136,13 +147,13 @@ def test_artifact_download_and_http_transport(fleet: Fleet, tmp_path: Path) -> N
     dest.mkdir()
     transport = HttpTransport("http://test", artifacts_dir=dest, agent_label="api-test")
 
-    def fake_request(method: str, path: str, json=None, params=None):  # type: ignore[no-untyped-def]
-        del method, params
+    def fake_request(method: str, path: str, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, params, session_id
         if path.endswith("/actions"):
             return shot.json()
         raise AssertionError(path)
 
-    def fake_bytes(method: str, path: str) -> bytes:
+    def fake_bytes(method: str, path: str, session_id: str | None = None) -> bytes:
         del method
         assert path == f"/sessions/{session_id}/artifacts/{name}"
         return downloaded.content

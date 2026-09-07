@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-
-from datetime import datetime, timezone
 
 from devicefleet.models import DeviceRecord, ProviderKind
 from devicefleet.registry import DeviceNotFoundError, DeviceRegistry, DuplicateDeviceError
@@ -121,3 +121,51 @@ def test_naive_registered_at_becomes_utc() -> None:
     assert [record.id, later.id] == [
         item.id for item in sorted([later, record], key=lambda item: item.registered_at)
     ]
+
+
+def test_reregister_keeps_display_name(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.register(
+        "phone-a",
+        ProviderKind.STUB,
+        "h1",
+        display_name="Pretty Name",
+    )
+    kept = registry.register("phone-a", ProviderKind.STUB, "h1")
+    assert kept.display_name == "Pretty Name"
+    renamed = registry.register(
+        "phone-a", ProviderKind.STUB, "h1", display_name="New Name"
+    )
+    assert renamed.display_name == "New Name"
+
+
+def test_register_strips_id_before_lookup(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.register("phone", ProviderKind.STUB, "h1", display_name="Original")
+    updated = registry.register(" phone ", ProviderKind.STUB, "h1", tags=["lab"])
+    assert updated.id == "phone"
+    assert updated.display_name == "Original"
+    assert updated.tags == ["lab"]
+    assert len(registry.list_devices()) == 1
+
+
+def test_concurrent_upsert_keeps_all_devices(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+
+    def writer(index: int) -> None:
+        registry.upsert(
+            DeviceRecord(
+                id=f"dev-{index}",
+                display_name=f"Dev {index}",
+                provider=ProviderKind.STUB,
+                provider_ref=f"h{index}",
+            )
+        )
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    ids = {item.id for item in registry.list_devices()}
+    assert ids == {f"dev-{i}" for i in range(16)}

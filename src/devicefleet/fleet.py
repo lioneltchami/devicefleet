@@ -170,13 +170,15 @@ class Fleet:
 
     def remove_device(self, device_id: str) -> DeviceRecord:
         """Remove a phone. Refuses if an active session holds it."""
-        busy = self.sessions.active_for_device(device_id)
-        if busy is not None:
-            raise DeviceInUseError(
-                f"device {device_id} is held by session {busy.id} "
-                f"({busy.agent_label}); stop the session first"
-            )
-        return self.registry.remove(device_id)
+        cleaned = device_id.strip()
+        with self._lease_lock(cleaned):
+            busy = self.sessions.active_for_device(cleaned)
+            if busy is not None:
+                raise DeviceInUseError(
+                    f"device {cleaned} is held by session {busy.id} "
+                    f"({busy.agent_label}); stop the session first"
+                )
+            return self.registry.remove(cleaned)
 
     def start_session(
         self,
@@ -207,19 +209,26 @@ class Fleet:
             return session
 
     def attach_session(
-        self, session_id: str, agent_label: str | None = None
+        self,
+        session_id: str,
+        agent_label: str | None = None,
+        session_secret: str | None = None,
     ) -> SessionRecord:
-        session = self.sessions.attach(session_id, agent_label=agent_label)
+        session = self.sessions.attach(
+            session_id, agent_label=agent_label, session_secret=session_secret
+        )
         self._set_current_session(session.id, session.agent_label)
         return session
 
     def stop_session(
-        self, session_id: str, agent_label: str | None = None
+        self,
+        session_id: str,
+        agent_label: str | None = None,
+        session_secret: str | None = None,
     ) -> SessionRecord:
         peek = self.sessions.get(session_id)
         with self._lease_lock(peek.device_id):
-            if agent_label:
-                self.sessions.require_owner(session_id, agent_label)
+            self.sessions.require_secret(session_id, session_secret)
             session = self.sessions.stop(session_id)
             self._clear_current_session(session.id, session.agent_label)
             self._release_cloud_handle(session)
@@ -230,23 +239,19 @@ class Fleet:
         session_id: str,
         request: ActionRequest,
         agent_label: str | None = None,
+        session_secret: str | None = None,
     ) -> ActionResult:
         peek = self.sessions.get(session_id)
         with self._lease_lock(peek.device_id):
-            return self._run_locked(session_id, request, agent_label)
+            return self._run_locked(session_id, request, session_secret)
 
     def _run_locked(
         self,
         session_id: str,
         request: ActionRequest,
-        agent_label: str | None,
+        session_secret: str | None,
     ) -> ActionResult:
-        if agent_label:
-            session = self.sessions.require_owner(session_id, agent_label)
-        else:
-            session = self.sessions.get(session_id)
-            if session.status != SessionStatus.ACTIVE:
-                raise SessionError(f"session {session_id} is not active")
+        session = self.sessions.require_secret(session_id, session_secret)
         try:
             device = self.registry.get(session.device_id)
         except DeviceNotFoundError:
@@ -323,7 +328,9 @@ class Fleet:
 
     def provision_stub(self, spec: CloudDeviceSpec | None = None) -> DeviceRecord:
         """Acquire an extra stub cloud phone and register it."""
-        discovered = self.stub.provision(spec or CloudDeviceSpec())
+        reserved = {device.id for device in self.registry.list_devices()}
+        reserved.update(device.provider_ref for device in self.registry.list_devices())
+        discovered = self.stub.provision(spec or CloudDeviceSpec(), reserved_ids=reserved)
         return self.registry.register(
             device_id=discovered.suggested_id or discovered.provider_ref,
             provider=ProviderKind.STUB,

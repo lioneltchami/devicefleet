@@ -93,7 +93,7 @@ Do not special-case the CLI or the HTTP routes. New farms should be invisible ab
 
 - iOS via macOS iPhone Mirroring / Accessibility — needs a separate provider, not an ADB look-alike
 - Production BrowserStack / Device Farm adapters
-- Richer authn than a shared `DEVICEFLEET_TOKEN` (v0 uses bearer / `X-Devicefleet-Token` plus agent ownership)
+- Richer authn than a shared `DEVICEFLEET_TOKEN` plus per-session capability secrets (`X-Devicefleet-Session`)
 - Rich IME / unicode input beyond `adb shell input text`
 - Richer distributed locking if many hosts share one `DEVICEFLEET_HOME` over NFS
 

@@ -45,10 +45,11 @@ class DeviceRegistry:
 
     def get(self, device_id: str) -> DeviceRecord:
         """Return a device by fleet id."""
+        cleaned = device_id.strip()
         for device in self._read_all():
-            if device.id == device_id:
+            if device.id == cleaned:
                 return device
-        raise DeviceNotFoundError(f"device not found: {device_id}")
+        raise DeviceNotFoundError(f"device not found: {cleaned}")
 
     def find(
         self,
@@ -58,9 +59,10 @@ class DeviceRegistry:
     ) -> list[DeviceRecord]:
         """Filter devices. Tags are an AND match on the normalized set."""
         wanted = {tag.strip().lower() for tag in (tags or []) if tag.strip()}
+        wanted_id = device_id.strip() if device_id else ""
         matches: list[DeviceRecord] = []
         for device in self._read_all():
-            if device_id and device.id != device_id:
+            if wanted_id and device.id != wanted_id:
                 continue
             if provider and device.provider != provider:
                 continue
@@ -102,13 +104,22 @@ class DeviceRegistry:
         ref = provider_ref.strip()
         if not ref:
             raise ValueError("provider_ref must not be empty")
+        cleaned_id = device_id.strip()
+        if not cleaned_id:
+            raise ValueError("device id must not be empty")
 
         def mutator(document: dict[str, object]) -> DeviceRecord:
             devices = self._parse(document)
-            existing = next((item for item in devices if item.id == device_id), None)
+            existing = next((item for item in devices if item.id == cleaned_id), None)
+            if display_name is None:
+                name = existing.display_name if existing else cleaned_id
+            else:
+                name = display_name.strip() or (
+                    existing.display_name if existing else cleaned_id
+                )
             record = DeviceRecord(
-                id=device_id,
-                display_name=display_name or (existing.display_name if existing else device_id),
+                id=cleaned_id,
+                display_name=name,
                 provider=provider,
                 provider_ref=ref,
                 tags=existing.tags if tags is None and existing else (tags or []),
@@ -122,7 +133,7 @@ class DeviceRegistry:
                 else (existing.last_status if existing else DeviceStatus.UNKNOWN),
                 notes=existing.notes if notes is None and existing else (notes or ""),
             )
-            kept = [item for item in devices if item.id != device_id]
+            kept = [item for item in devices if item.id != cleaned_id]
             _reject_duplicate_ref(kept, record)
             kept.append(record)
             kept.sort(key=lambda item: item.registered_at)
@@ -136,16 +147,17 @@ class DeviceRegistry:
         """Delete a device from the registry."""
 
         def mutator(document: dict[str, object]) -> DeviceRecord:
+            cleaned = device_id.strip()
             devices = self._parse(document)
             kept: list[DeviceRecord] = []
             removed: DeviceRecord | None = None
             for device in devices:
-                if device.id == device_id:
+                if device.id == cleaned:
                     removed = device
                 else:
                     kept.append(device)
             if removed is None:
-                raise DeviceNotFoundError(f"device not found: {device_id}")
+                raise DeviceNotFoundError(f"device not found: {cleaned}")
             document.clear()
             document.update(self._dump(kept))
             return removed

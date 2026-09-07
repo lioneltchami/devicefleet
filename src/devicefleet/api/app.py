@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from devicefleet import __version__
-from devicefleet.auth import agent_from_headers, require_fleet_token
+from devicefleet.auth import (
+    agent_from_headers,
+    agent_header_optional,
+    require_fleet_token,
+    session_secret_from_headers,
+)
 from devicefleet.fleet import DeviceInUseError, Fleet, FleetError
 from devicefleet.models import (
     ActionRequest,
@@ -16,7 +21,8 @@ from devicefleet.models import (
     DeviceRecord,
     DiscoveredDevice,
     ProviderKind,
-    SessionRecord,
+    SessionGrant,
+    SessionPublic,
 )
 from devicefleet.providers.base import ProviderError
 from devicefleet.registry import DeviceNotFoundError, DuplicateDeviceError
@@ -30,11 +36,12 @@ class DiscoverBody(BaseModel):
 class StartSessionBody(BaseModel):
     device_id: str | None = None
     tags: list[str] = Field(default_factory=list)
-    agent_label: str = "anonymous"
+    agent_label: str | None = None
 
 
 class AttachBody(BaseModel):
-    agent_label: str
+    agent_label: str | None = None
+    secret: str | None = None
 
 
 class RegisterDeviceBody(BaseModel):
@@ -56,6 +63,14 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, (SessionError, ProviderError, ValueError)):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=500, detail="internal fleet error")
+
+
+def _grant(session) -> SessionGrant:
+    return SessionGrant.model_validate(session.model_dump())
+
+
+def _public(session) -> SessionPublic:
+    return SessionPublic.model_validate(session.public_dump())
 
 
 def create_app(fleet: Fleet | None = None) -> FastAPI:
@@ -107,40 +122,54 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
         except (DeviceNotFoundError, DeviceInUseError) as exc:
             raise _http_error(exc) from exc
 
-    @protected.post("/sessions", response_model=SessionRecord)
-    def start_session(body: StartSessionBody) -> SessionRecord:
+    @protected.post("/sessions", response_model=SessionGrant)
+    def start_session(body: StartSessionBody, request: Request) -> SessionGrant:
+        agent = body.agent_label or agent_from_headers(request)
         try:
-            return host_fleet.start_session(
+            session = host_fleet.start_session(
                 device_id=body.device_id,
                 tags=body.tags or None,
-                agent_label=body.agent_label,
+                agent_label=agent,
             )
         except (DeviceNotFoundError, DeviceBusyError, FleetError) as exc:
             raise _http_error(exc) from exc
+        return _grant(session)
 
-    @protected.get("/sessions", response_model=list[SessionRecord])
-    def list_sessions(active_only: bool = False) -> list[SessionRecord]:
-        return host_fleet.sessions.list_sessions(active_only=active_only)
+    @protected.get("/sessions", response_model=list[SessionPublic])
+    def list_sessions(active_only: bool = False) -> list[SessionPublic]:
+        return [_public(item) for item in host_fleet.sessions.list_sessions(active_only=active_only)]
 
-    @protected.get("/sessions/{session_id}", response_model=SessionRecord)
-    def get_session(session_id: str) -> SessionRecord:
+    @protected.get("/sessions/{session_id}", response_model=SessionPublic)
+    def get_session(session_id: str) -> SessionPublic:
         try:
-            return host_fleet.sessions.get(session_id)
+            return _public(host_fleet.sessions.get(session_id))
         except SessionNotFoundError as exc:
             raise _http_error(exc) from exc
 
-    @protected.post("/sessions/{session_id}/attach", response_model=SessionRecord)
-    def attach_session(session_id: str, body: AttachBody) -> SessionRecord:
+    @protected.post("/sessions/{session_id}/attach", response_model=SessionGrant)
+    def attach_session(
+        session_id: str,
+        request: Request,
+        body: AttachBody = Body(default_factory=AttachBody),
+    ) -> SessionGrant:
+        agent = body.agent_label or agent_header_optional(request)
+        secret = body.secret or session_secret_from_headers(request)
         try:
-            return host_fleet.attach_session(session_id, agent_label=body.agent_label)
+            session = host_fleet.attach_session(
+                session_id, agent_label=agent, session_secret=secret
+            )
         except (SessionNotFoundError, SessionError, SessionOwnershipError) as exc:
             raise _http_error(exc) from exc
+        return _grant(session)
 
-    @protected.delete("/sessions/{session_id}", response_model=SessionRecord)
-    def stop_session(session_id: str, request: Request) -> SessionRecord:
-        agent = agent_from_headers(request)
+    @protected.delete("/sessions/{session_id}", response_model=SessionPublic)
+    def stop_session(session_id: str, request: Request) -> SessionPublic:
+        agent = agent_header_optional(request)
+        secret = session_secret_from_headers(request)
         try:
-            return host_fleet.stop_session(session_id, agent_label=agent)
+            session = host_fleet.stop_session(
+                session_id, agent_label=agent, session_secret=secret
+            )
         except (
             SessionNotFoundError,
             SessionOwnershipError,
@@ -148,16 +177,17 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
             SessionError,
         ) as exc:
             raise _http_error(exc) from exc
+        return _public(session)
 
     @protected.get("/sessions/{session_id}/artifacts/{name}")
     def get_session_artifact(
         session_id: str, name: str, request: Request
     ) -> FileResponse:
-        agent = agent_from_headers(request)
+        secret = session_secret_from_headers(request)
         try:
-            host_fleet.sessions.require_owner(session_id, agent)
+            host_fleet.sessions.require_secret(session_id, secret)
             path = host_fleet.artifact_file(session_id, name)
-        except (SessionNotFoundError, SessionOwnershipError, ValueError) as exc:
+        except (SessionNotFoundError, SessionOwnershipError, SessionError, ValueError) as exc:
             raise _http_error(exc) from exc
         if not path.is_file():
             raise HTTPException(status_code=404, detail=f"artifact not found: {name}")
@@ -165,9 +195,12 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
 
     @protected.post("/sessions/{session_id}/actions", response_model=ActionResult)
     def run_action(session_id: str, body: ActionRequest, request: Request) -> ActionResult:
-        agent = agent_from_headers(request)
+        agent = agent_header_optional(request)
+        secret = session_secret_from_headers(request)
         try:
-            return host_fleet.run(session_id, body, agent_label=agent)
+            return host_fleet.run(
+                session_id, body, agent_label=agent, session_secret=secret
+            )
         except (
             SessionNotFoundError,
             SessionOwnershipError,

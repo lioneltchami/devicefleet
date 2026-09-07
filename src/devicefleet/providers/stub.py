@@ -151,11 +151,19 @@ class StubCloudProvider(DeviceProvider):
             "actions": str(len(phone.actions)),
         }
 
-    def provision(self, spec: CloudDeviceSpec) -> DiscoveredDevice:
-        """Allocate another virtual phone. Used to demo cloud acquire."""
+    def provision(
+        self,
+        spec: CloudDeviceSpec,
+        reserved_ids: set[str] | None = None,
+    ) -> DiscoveredDevice:
+        """Allocate another virtual phone. Used to demo cloud acquire.
+
+        `reserved_ids` are fleet registry ids / refs that must not be reused
+        so a new stub cannot upsert over an existing non-stub device.
+        """
         if spec.platform != "android":
             raise ProviderError("StubCloudProvider only simulates Android")
-        handle = self._next_handle()
+        handle = self._next_handle(reserved_ids)
         name = spec.model or f"Stub Cloud Phone {handle}"
         phone = _VirtualPhone(handle=handle, display_name=name)
         self._phones[handle] = phone
@@ -182,11 +190,14 @@ class StubCloudProvider(DeviceProvider):
                 phone.display_name = display_name
             self._persist()
 
-    def _next_handle(self) -> str:
+    def _next_handle(self, reserved_ids: set[str] | None = None) -> str:
+        taken = set(self._phones)
+        if reserved_ids:
+            taken |= reserved_ids
         index = 1
         while True:
             handle = f"stub-phone-{index}"
-            if handle not in self._phones:
+            if handle not in taken:
                 return handle
             index += 1
 

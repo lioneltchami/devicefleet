@@ -50,27 +50,47 @@ class LocalTransport:
         self,
         device_id: str | None = None,
         tags: list[str] | None = None,
-        agent_label: str = "anonymous",
+        agent_label: str | None = None,
     ) -> SessionRecord:
         return self.fleet.start_session(
-            device_id=device_id, tags=tags, agent_label=agent_label
+            device_id=device_id,
+            tags=tags,
+            agent_label=agent_label or self.agent_label,
         )
 
     def attach_session(
-        self, session_id: str, agent_label: str | None = None
+        self,
+        session_id: str,
+        agent_label: str | None = None,
+        session_secret: str | None = None,
     ) -> SessionRecord:
         return self.fleet.attach_session(
-            session_id, agent_label=agent_label or self.agent_label
+            session_id,
+            agent_label=agent_label or self.agent_label,
+            session_secret=session_secret or self._secret(session_id),
         )
 
     def list_sessions(self, active_only: bool = False) -> list[SessionRecord]:
         return self.fleet.sessions.list_sessions(active_only=active_only)
 
     def stop_session(self, session_id: str) -> SessionRecord:
-        return self.fleet.stop_session(session_id, agent_label=self.agent_label)
+        return self.fleet.stop_session(
+            session_id,
+            agent_label=self.agent_label,
+            session_secret=self._secret(session_id),
+        )
 
     def run(self, session_id: str, request: ActionRequest) -> ActionResult:
-        return self.fleet.run(session_id, request, agent_label=self.agent_label)
+        return self.fleet.run(
+            session_id,
+            request,
+            agent_label=self.agent_label,
+            session_secret=self._secret(session_id),
+        )
 
     def current_session_id(self) -> str | None:
         return self.fleet.current_session_id(self.agent_label)
+
+    def _secret(self, session_id: str) -> str:
+        """Local processes can read the secret from the data directory."""
+        return self.fleet.sessions.get(session_id).secret

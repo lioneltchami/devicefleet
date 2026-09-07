@@ -245,10 +245,7 @@ class Fleet:
             session = self.sessions.start(
                 fresh.id,
                 agent_label=label,
-                metadata={
-                    "provider": fresh.provider.value,
-                    "provider_ref": fresh.provider_ref,
-                },
+                metadata=_session_device_metadata(fresh),
             )
             self._set_current_session(session.id, label)
             return session
@@ -388,13 +385,15 @@ class Fleet:
             discovered = self.stub.provision(
                 spec or CloudDeviceSpec(), reserved_ids=reserved
             )
+            meta = dict(discovered.metadata)
+            meta["provisioned"] = "true"
             return self.registry.register(
                 device_id=discovered.suggested_id or discovered.provider_ref,
                 provider=ProviderKind.STUB,
                 provider_ref=discovered.provider_ref,
                 display_name=discovered.display_name,
                 tags=discovered.suggested_tags,
-                metadata=discovered.metadata,
+                metadata=meta,
                 last_status=DeviceStatus.ONLINE,
             )
 
@@ -551,6 +550,8 @@ class Fleet:
             return
         if not handle or handle == DEFAULT_HANDLE:
             return
+        if kind == ProviderKind.STUB.value and not _is_provisioned(session):
+            return
         provider = self.stub if kind == ProviderKind.STUB.value else self._cloud_provider
         release = getattr(provider, "release_cloud", None) if provider is not None else None
         if callable(release):
@@ -569,3 +570,17 @@ class Fleet:
                 self.registry.remove(session.device_id)
             except DeviceNotFoundError:
                 pass
+
+
+def _session_device_metadata(device: DeviceRecord) -> dict[str, str]:
+    metadata = {
+        "provider": device.provider.value,
+        "provider_ref": device.provider_ref,
+    }
+    if device.metadata.get("provisioned") == "true":
+        metadata["provisioned"] = "true"
+    return metadata
+
+
+def _is_provisioned(session: SessionRecord) -> bool:
+    return session.metadata.get("provisioned") == "true"

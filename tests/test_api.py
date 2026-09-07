@@ -265,3 +265,29 @@ def test_http_transport_encodes_tags_and_device_ids() -> None:
     assert seen["params"] == [("tag", "ios,lab"), ("tag", "android")]
     transport.remove_device("lab/a")
     assert seen["path"] == "/devices/lab%2Fa"
+
+
+def test_http_transport_retains_start_agent_label() -> None:
+    transport = HttpTransport("http://test", agent_label="anonymous")
+    seen: dict[str, object] = {}
+
+    def fake_request(method, path, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, path, params, session_id
+        seen["json"] = json
+        return {
+            "id": "ses_abc123",
+            "device_id": "stub-demo",
+            "agent_label": "worker-a",
+            "status": "active",
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "secret": "cap_test",
+            "metadata": {},
+        }
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    session = transport.start_session(device_id="stub-demo", agent_label="worker-a")
+    assert session.agent_label == "worker-a"
+    assert transport.agent_label == "worker-a"
+    payload = seen["json"]
+    assert isinstance(payload, dict)
+    assert payload["agent_label"] == "worker-a"

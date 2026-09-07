@@ -222,16 +222,23 @@ class DeviceRegistry:
     def ensure_stub_demo(self) -> DeviceRecord:
         """Guarantee a demo device exists so the stub path works offline."""
         try:
-            return self.get("stub-demo")
+            existing = self.get("stub-demo")
         except DeviceNotFoundError:
-            return self.register(
-                device_id="stub-demo",
-                provider=ProviderKind.STUB,
-                provider_ref="stub-phone-1",
-                display_name="Stub Demo Phone",
-                tags=["demo", "stub", "android"],
-                notes="Virtual device from StubCloudProvider. No hardware required.",
-            )
+            existing = None
+        if (
+            existing is not None
+            and existing.provider is ProviderKind.STUB
+            and existing.provider_ref == "stub-phone-1"
+        ):
+            return existing
+        return self.register(
+            device_id="stub-demo",
+            provider=ProviderKind.STUB,
+            provider_ref="stub-phone-1",
+            display_name="Stub Demo Phone",
+            tags=["demo", "stub", "android"],
+            notes="Virtual device from StubCloudProvider. No hardware required.",
+        )
 
 
 def _reject_duplicate_ref(others: list[DeviceRecord], candidate: DeviceRecord) -> None:

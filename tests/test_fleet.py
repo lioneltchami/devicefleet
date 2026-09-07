@@ -174,6 +174,7 @@ def test_stub_registry_rehydrates_and_provision_avoids_collision(
 def test_stopped_provisioned_stub_is_not_leaseable(fleet: Fleet) -> None:
     extra = fleet.provision_stub()
     extra_id = extra.id
+    assert extra.metadata.get("provisioned") == "true"
     session = fleet.start_session(device_id=extra_id, agent_label="temp")
     fleet.stop_session(session.id, agent_label="temp", session_secret=session.secret)
     with pytest.raises((DeviceNotFoundError, FleetError)):
@@ -544,3 +545,21 @@ def test_concurrent_provision_stub_unique_ids(fleet: Fleet) -> None:
     assert len(set(created)) == 8
     refs = {fleet.registry.get(device_id).provider_ref for device_id in created}
     assert len(refs) == 8
+
+
+def test_user_registered_stub_survives_session_stop(fleet: Fleet) -> None:
+    custom = fleet.register_device(
+        device_id="lab-stub",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-custom",
+        display_name="Lab Stub",
+    )
+    assert custom.metadata.get("provisioned") != "true"
+    session = fleet.start_session(device_id="lab-stub", agent_label="lab")
+    fleet.stop_session(session.id, session_secret=session.secret)
+    kept = fleet.registry.get("lab-stub")
+    assert kept.provider_ref == "stub-phone-custom"
+    assert fleet.stub.health("stub-phone-custom") is True
+    again = fleet.start_session(device_id="lab-stub", agent_label="lab-2")
+    assert again.device_id == "lab-stub"
+    fleet.stop_session(again.id, session_secret=again.secret)

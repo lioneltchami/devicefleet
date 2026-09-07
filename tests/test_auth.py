@@ -138,3 +138,16 @@ def test_local_transport_cannot_drive_another_agents_session(tmp_path: Path) -> 
         bob.stop_session(session.id)
     stopped = alice.stop_session(session.id)
     assert stopped.status.value == "released"
+
+
+def test_local_transport_retains_start_agent_label(tmp_path: Path) -> None:
+    fleet = Fleet(load_settings(tmp_path / "home"))
+    extra = fleet.provision_stub()
+    transport = LocalTransport(fleet, agent_label="anonymous")
+    session = transport.start_session(device_id=extra.id, agent_label="worker-a")
+    assert session.agent_label == "worker-a"
+    assert transport.agent_label == "worker-a"
+    result = transport.run(session.id, ActionRequest(name=ActionName.INFO))
+    assert result.ok
+    stopped = transport.stop_session(session.id)
+    assert stopped.status.value == "released"

@@ -89,7 +89,7 @@ class HttpTransport:
         payload = {
             "device_id": device_id,
             "tags": tags or [],
-            "agent_label": agent_label or self.agent_label,
+            "agent_label": self._adopt_agent(agent_label),
         }
         data = self._request("POST", "/sessions", json=payload)
         session = SessionRecord.model_validate(data)
@@ -102,7 +102,7 @@ class HttpTransport:
         agent_label: str | None = None,
         session_secret: str | None = None,
     ) -> SessionRecord:
-        label = agent_label or self.agent_label
+        label = self._adopt_agent(agent_label)
         if session_secret:
             self._remember_secret(session_id, session_secret)
         data = self._request(
@@ -160,6 +160,12 @@ class HttpTransport:
     def current_session_id(self) -> str | None:
         """Remote agents must pass --session; the host has no shared current."""
         return None
+
+    def _adopt_agent(self, agent_label: str | None) -> str:
+        label = (agent_label or self.agent_label).strip() or "anonymous"
+        if agent_label and agent_label.strip():
+            self.agent_label = label
+        return label
 
     def _remember_secret(self, session_id: str, secret: str) -> None:
         if not session_id or not secret:

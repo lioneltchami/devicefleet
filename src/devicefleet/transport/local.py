@@ -56,7 +56,7 @@ class LocalTransport:
         return self.fleet.start_session(
             device_id=device_id,
             tags=tags,
-            agent_label=agent_label or self.agent_label,
+            agent_label=self._adopt_agent(agent_label),
         )
 
     def attach_session(
@@ -67,7 +67,7 @@ class LocalTransport:
     ) -> SessionRecord:
         return self.fleet.attach_session(
             session_id,
-            agent_label=agent_label or self.agent_label,
+            agent_label=self._adopt_agent(agent_label),
             session_secret=session_secret or self._secret(session_id),
         )
 
@@ -91,6 +91,12 @@ class LocalTransport:
 
     def current_session_id(self) -> str | None:
         return self.fleet.current_session_id(self.agent_label)
+
+    def _adopt_agent(self, agent_label: str | None) -> str:
+        label = (agent_label or self.agent_label).strip() or "anonymous"
+        if agent_label and agent_label.strip():
+            self.agent_label = label
+        return label
 
     def _secret(self, session_id: str) -> str:
         """Read the capability secret only for sessions this agent owns."""

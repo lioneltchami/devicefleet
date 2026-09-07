@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+import uvicorn
 from typer.testing import CliRunner
 
 from devicefleet.cli import app
+from devicefleet.doctor import Check, DoctorReport
 
 runner = CliRunner()
 
@@ -151,3 +154,47 @@ def test_register_strips_ref_whitespace(tmp_path: Path) -> None:
     assert listed.exit_code == 0
     assert "stub-phone-5" in listed.stdout
     assert "  stub-phone-5  " not in listed.stdout
+
+
+def test_doctor_json_exits_nonzero_when_unhealthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_doctor(fleet: object) -> DoctorReport:
+        del fleet
+        return DoctorReport(
+            version="0.1.0",
+            ok=False,
+            checks=[Check(name="python", ok=False, detail="need 3.11+")],
+        )
+
+    monkeypatch.setattr("devicefleet.cli.run_doctor", fake_doctor)
+    result = runner.invoke(
+        app, ["--home", str(tmp_path / "home"), "doctor", "--json"]
+    )
+    assert result.exit_code == 1
+    assert "python" in result.stdout
+
+
+def test_doctor_json_healthy_exits_zero(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["--home", str(tmp_path / "home"), "doctor", "--json"]
+    )
+    assert result.exit_code == 0
+    assert '"ok": true' in result.stdout or '"ok":true' in result.stdout
+
+
+def test_serve_port_zero_is_honored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(app: object, host: str, port: int) -> None:
+        del app
+        captured["host"] = host
+        captured["port"] = port
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    result = runner.invoke(
+        app, ["--home", str(tmp_path / "home"), "serve", "--port", "0"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 0
+    assert "http://127.0.0.1:0" in result.stdout

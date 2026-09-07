@@ -142,6 +142,8 @@ def doctor(
     report = run_doctor(_fleet(ctx))
     if as_json:
         console.print_json(report.model_dump_json())
+        if not report.ok:
+            raise typer.Exit(code=1)
         return
     console.print(f"[bold]devicefleet {report.version}[/bold] doctor")
     for check in report.checks:
@@ -178,7 +180,7 @@ def serve(
 
     settings: Settings = ctx.obj["settings"]
     bind_host = host or settings.host
-    bind_port = port or settings.port
+    bind_port = settings.port if port is None else port
     token = ctx.obj.get("token") or settings.token
     try:
         validate_serve_bind(bind_host, token)

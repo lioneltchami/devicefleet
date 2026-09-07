@@ -381,18 +381,22 @@ class Fleet:
 
     def provision_stub(self, spec: CloudDeviceSpec | None = None) -> DeviceRecord:
         """Acquire an extra stub cloud phone and register it."""
-        reserved = {device.id for device in self.registry.list_devices()}
-        reserved.update(device.provider_ref for device in self.registry.list_devices())
-        discovered = self.stub.provision(spec or CloudDeviceSpec(), reserved_ids=reserved)
-        return self.registry.register(
-            device_id=discovered.suggested_id or discovered.provider_ref,
-            provider=ProviderKind.STUB,
-            provider_ref=discovered.provider_ref,
-            display_name=discovered.display_name,
-            tags=discovered.suggested_tags,
-            metadata=discovered.metadata,
-            last_status=DeviceStatus.ONLINE,
-        )
+        with self._provision_lock():
+            devices = self.registry.list_devices()
+            reserved = {device.id for device in devices}
+            reserved.update(device.provider_ref for device in devices)
+            discovered = self.stub.provision(
+                spec or CloudDeviceSpec(), reserved_ids=reserved
+            )
+            return self.registry.register(
+                device_id=discovered.suggested_id or discovered.provider_ref,
+                provider=ProviderKind.STUB,
+                provider_ref=discovered.provider_ref,
+                display_name=discovered.display_name,
+                tags=discovered.suggested_tags,
+                metadata=discovered.metadata,
+                last_status=DeviceStatus.ONLINE,
+            )
 
     def current_session_id(self, agent_label: str | None = None) -> str | None:
         """Return this agent's remembered session, never another agent's."""
@@ -456,6 +460,9 @@ class Fleet:
     def _lease_lock(self, device_id: str) -> ExclusiveFileLock:
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in device_id)
         return ExclusiveFileLock(self.settings.home / "locks" / f"{safe}.lock")
+
+    def _provision_lock(self) -> ExclusiveFileLock:
+        return ExclusiveFileLock(self.settings.home / "locks" / "provision-stub.lock")
 
     def artifact_file(self, session_id: str, name: str) -> Path:
         """Resolve a host-side artifact path; reject traversal."""

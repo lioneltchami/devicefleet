@@ -521,3 +521,26 @@ def test_local_start_preserves_remote_session_secrets(fleet: Fleet) -> None:
     assert isinstance(mapping, dict)
     assert mapping.get("local") == session.id
     assert mapping.get("remote") == "ses_old"
+
+
+def test_concurrent_provision_stub_unique_ids(fleet: Fleet) -> None:
+    created: list[str] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            record = fleet.provision_stub()
+            created.append(record.id)
+        except BaseException as exc:  # noqa: BLE001 — collect any race error
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert len(created) == 8
+    assert len(set(created)) == 8
+    refs = {fleet.registry.get(device_id).provider_ref for device_id in created}
+    assert len(refs) == 8

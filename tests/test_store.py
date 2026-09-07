@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
+
+import pytest
 
 from devicefleet.store import YamlStore
 
@@ -49,3 +52,33 @@ def test_update_merges_under_lock(tmp_path: Path) -> None:
     mapping = store.load()["current_sessions"]
     assert isinstance(mapping, dict)
     assert len(mapping) == 12
+
+
+def test_save_fsyncs_parent_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = YamlStore(tmp_path / "state.yaml")
+    opened: list[tuple[str, int]] = []
+    real_open = os.open
+    real_fsync = os.fsync
+
+    def tracking_open(path: str | bytes | os.PathLike[str], flags: int, *args: int) -> int:
+        opened.append((str(path), flags))
+        return real_open(path, flags, *args)
+
+    fsynced = 0
+
+    def tracking_fsync(fd: int) -> None:
+        nonlocal fsynced
+        fsynced += 1
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "open", tracking_open)  # type: ignore[attr-defined]
+    monkeypatch.setattr(os, "fsync", tracking_fsync)  # type: ignore[attr-defined]
+    store.save({"ok": True})
+    parent = str(tmp_path)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    assert any(
+        path == parent and (flags & directory_flag or directory_flag == 0)
+        for path, flags in opened
+    )
+    assert fsynced >= 2
+    assert store.load()["ok"] is True

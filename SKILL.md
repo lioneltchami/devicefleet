@@ -47,7 +47,7 @@ devicefleet session list --active
 
 `--tag` is AND. If every matching device is busy, start fails — pick another tag or wait. Do not “just run adb” on a device that already has a session.
 
-Locally, the CLI remembers **your** current session, keyed by `--agent` / `DEVICEFLEET_AGENT`. Another agent in the same data dir will not pick it up. `DEVICEFLEET_CURRENT_SESSION` overrides that memory for this process only. On `--remote`, always pass `--session` (there is no shared current session). Attach/run/stop on a remote host require the session secret returned at start (`X-Devicefleet-Session`); the CLI stores it under `$DEVICEFLEET_HOME`. Knowing another agent's label is not enough.
+Locally, the CLI remembers **your** current session, keyed by `--agent` / `DEVICEFLEET_AGENT`. Another agent in the same data dir will not pick it up. `DEVICEFLEET_CURRENT_SESSION` overrides that memory for this process only. On `--remote`, `run` and similar helpers take `--session` (there is no shared current session). `session stop` takes the id as a **positional** argument (`session stop ses_…`); `--session` is also accepted so you can match other commands. Do not omit the id on a remote host — the lease stays active. Attach/run/stop on a remote host require the session secret returned at start (`X-Devicefleet-Session`); the CLI stores it under `$DEVICEFLEET_HOME`. Knowing another agent's label is not enough.
 
 ## Helpers
 
@@ -87,6 +87,7 @@ devicefleet serve --host 0.0.0.0 --port 8765
 export DEVICEFLEET_TOKEN=replace-me
 devicefleet --remote http://lab:8765 --agent coder session start --tag android
 devicefleet --remote http://lab:8765 --agent coder run screenshot --session ses_…
+devicefleet --remote http://lab:8765 --agent coder session stop ses_…
 ```
 
 `DEVICEFLEET_REMOTE_URL` sets the default remote. Send the token with `--token` or `DEVICEFLEET_TOKEN`.

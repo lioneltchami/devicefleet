@@ -90,6 +90,12 @@ class YamlStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_name, self.path)
+            dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            dir_fd = os.open(self.path.parent, dir_flags)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except Exception:
             try:
                 os.unlink(tmp_name)

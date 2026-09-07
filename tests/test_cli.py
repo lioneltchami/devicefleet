@@ -50,6 +50,25 @@ def test_doctor_and_stub_flow(tmp_path: Path) -> None:
     assert stopped.exit_code == 0, stopped.stdout
 
 
+def test_session_stop_accepts_session_flag(tmp_path: Path) -> None:
+    home = str(tmp_path / "home")
+    started = runner.invoke(
+        app,
+        ["--home", home, "session", "start", "--device", "stub-demo", "--json"],
+    )
+    assert started.exit_code == 0, started.stdout
+    session_id = next(
+        part.strip().strip('",')
+        for part in started.stdout.replace(",", " ").split()
+        if part.strip().strip('",').startswith("ses_")
+    )
+    stopped = runner.invoke(
+        app, ["--home", home, "session", "stop", "--session", session_id]
+    )
+    assert stopped.exit_code == 0, stopped.stdout
+    assert session_id in stopped.stdout
+
+
 def test_devices_rm_refuses_active_session(tmp_path: Path) -> None:
     home = str(tmp_path / "home")
     started = runner.invoke(
@@ -94,6 +113,8 @@ def test_skill_mentions_sessions() -> None:
     )
     assert "DEVICEFLEET_SESSION" not in scrubbed
     assert "downloads those files" in result.stdout
+    assert "session stop ses_" in result.stdout
+    assert "positional" in result.stdout
 
 
 def test_remote_doctor_is_rejected(tmp_path: Path) -> None:

@@ -85,6 +85,11 @@ class Fleet:
                 found.extend(self.adb.discover())
             except ProviderError:
                 pass
+        if self._cloud_provider is not None:
+            try:
+                found.extend(self._cloud_provider.discover())
+            except ProviderError:
+                pass
         if save:
             for item in found:
                 device_id = item.suggested_id or item.provider_ref
@@ -214,11 +219,13 @@ class Fleet:
         agent_label: str | None = None,
         session_secret: str | None = None,
     ) -> SessionRecord:
-        session = self.sessions.attach(
-            session_id, agent_label=agent_label, session_secret=session_secret
-        )
-        self._set_current_session(session.id, session.agent_label)
-        return session
+        peek = self.sessions.get(session_id)
+        with self._lease_lock(peek.device_id):
+            session = self.sessions.attach(
+                session_id, agent_label=agent_label, session_secret=session_secret
+            )
+            self._set_current_session(session.id, session.agent_label)
+            return session
 
     def stop_session(
         self,
@@ -228,10 +235,15 @@ class Fleet:
     ) -> SessionRecord:
         peek = self.sessions.get(session_id)
         with self._lease_lock(peek.device_id):
+            current = self.sessions.get(session_id)
+            if current.status is SessionStatus.RELEASED:
+                self._clear_current_session(current.id, current.agent_label)
+                return current
             self.sessions.require_secret(session_id, session_secret)
             session = self.sessions.stop(session_id)
             self._clear_current_session(session.id, session.agent_label)
-            self._release_cloud_handle(session)
+            if current.status is SessionStatus.ACTIVE:
+                self._release_cloud_handle(session)
             return session
 
     def run(
@@ -389,13 +401,16 @@ class Fleet:
     def _is_leaseable(self, device: DeviceRecord) -> bool:
         if self.sessions.active_for_device(device.id) is not None:
             return False
-        if device.provider is ProviderKind.CLOUD and self._cloud_provider is None:
-            return False
-        if device.provider is ProviderKind.STUB and not self.stub.health(device.provider_ref):
-            return False
-        if device.last_status is DeviceStatus.OFFLINE:
-            return False
-        return True
+        if device.provider is ProviderKind.STUB:
+            return self.stub.health(device.provider_ref)
+        live = self._probe_live_statuses().get((device.provider, device.provider_ref))
+        if device.provider is ProviderKind.ADB:
+            return live is DeviceStatus.ONLINE
+        if device.provider is ProviderKind.CLOUD:
+            if self._cloud_provider is None:
+                return False
+            return live is DeviceStatus.ONLINE
+        return False
 
     def _lease_lock(self, device_id: str) -> ExclusiveFileLock:
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in device_id)
@@ -468,26 +483,41 @@ class Fleet:
             for device in self.registry.list_devices():
                 if device.provider is ProviderKind.ADB:
                     live[(ProviderKind.ADB, device.provider_ref)] = DeviceStatus.OFFLINE
+        if self._cloud_provider is not None:
+            try:
+                for item in self._cloud_provider.discover():
+                    live[(ProviderKind.CLOUD, item.provider_ref)] = item.status
+            except ProviderError:
+                pass
+            for device in self.registry.list_devices():
+                if device.provider is ProviderKind.CLOUD:
+                    live.setdefault(
+                        (ProviderKind.CLOUD, device.provider_ref), DeviceStatus.OFFLINE
+                    )
         return live
 
     def _release_cloud_handle(self, session: SessionRecord) -> None:
-        handle = session.metadata.get("provider_ref")
-        kind = session.metadata.get("provider")
-        try:
-            device = self.registry.get(session.device_id)
-            handle = device.provider_ref
-            kind = device.provider.value
-        except DeviceNotFoundError:
-            pass
+        """Release the handle captured at lease time, not the current registry ref."""
+        handle = (session.metadata.get("provider_ref") or "").strip()
+        kind = (session.metadata.get("provider") or "").strip()
         if kind not in {ProviderKind.STUB.value, ProviderKind.CLOUD.value}:
             return
         if not handle or handle == DEFAULT_HANDLE:
             return
+        provider = self.stub if kind == ProviderKind.STUB.value else self._cloud_provider
+        release = getattr(provider, "release_cloud", None) if provider is not None else None
+        if callable(release):
+            try:
+                release(handle)
+            except ProviderError:
+                pass
+        if kind != ProviderKind.STUB.value:
+            return
         try:
-            self.stub.release_cloud(handle)
-        except ProviderError:
-            pass
-        if kind == ProviderKind.STUB.value:
+            device = self.registry.get(session.device_id)
+        except DeviceNotFoundError:
+            return
+        if device.provider is ProviderKind.STUB and device.provider_ref == handle:
             try:
                 self.registry.remove(session.device_id)
             except DeviceNotFoundError:

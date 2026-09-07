@@ -7,9 +7,74 @@ import pytest
 
 from devicefleet.config import load_settings
 from devicefleet.fleet import DeviceInUseError, Fleet, FleetError
-from devicefleet.models import ActionName, ActionRequest, ProviderKind
+from devicefleet.models import (
+    ActionName,
+    ActionRequest,
+    DeviceStatus,
+    DiscoveredDevice,
+    ProviderKind,
+)
+from devicefleet.providers.base import DeviceProvider
 from devicefleet.registry import DeviceNotFoundError
 from devicefleet.sessions import DeviceBusyError, SessionError
+
+
+class FakeCloudProvider(DeviceProvider):
+    """Minimal hosted-farm adapter for fleet tests."""
+
+    provider_id = "cloud"
+
+    def __init__(self) -> None:
+        self.devices: dict[str, DiscoveredDevice] = {}
+        self.released: list[str] = []
+
+    def add(self, ref: str, name: str = "Farm Phone") -> DiscoveredDevice:
+        item = DiscoveredDevice(
+            provider=ProviderKind.CLOUD,
+            provider_ref=ref,
+            display_name=name,
+            status=DeviceStatus.ONLINE,
+            suggested_id=ref,
+            suggested_tags=["cloud", "farm"],
+        )
+        self.devices[ref] = item
+        return item
+
+    def discover(self) -> list[DiscoveredDevice]:
+        return list(self.devices.values())
+
+    def screenshot(self, handle: str) -> bytes:
+        return b""
+
+    def tap(self, handle: str, x: int, y: int) -> None:
+        return None
+
+    def swipe(
+        self,
+        handle: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        duration_ms: int = 300,
+    ) -> None:
+        return None
+
+    def type_text(self, handle: str, text: str) -> None:
+        return None
+
+    def keyevent(self, handle: str, key: str) -> None:
+        return None
+
+    def dump_ui(self, handle: str) -> str:
+        return "<hierarchy/>"
+
+    def release_cloud(self, handle: str) -> None:
+        self.released.append(handle)
+        self.devices.pop(handle, None)
+
+    def health(self, handle: str) -> bool:
+        return handle in self.devices
 
 
 def test_stub_session_helpers_without_hardware(fleet: Fleet) -> None:
@@ -276,3 +341,117 @@ def test_remove_and_start_do_not_orphan_session(fleet: Fleet) -> None:
     else:
         with pytest.raises(DeviceNotFoundError):
             fleet.registry.get(extra.id)
+
+
+def test_adb_unknown_is_not_leaseable_but_stub_demo_is(fleet: Fleet) -> None:
+    fleet.register_device(
+        device_id="ghost-pixel",
+        provider=ProviderKind.ADB,
+        provider_ref="SERIAL-MISSING",
+        display_name="Ghost",
+    )
+    assert fleet.registry.get("ghost-pixel").last_status is DeviceStatus.UNKNOWN
+    with pytest.raises(FleetError, match="not available|unavailable"):
+        fleet.start_session(device_id="ghost-pixel", agent_label="adb")
+    demo = fleet.start_session(device_id="stub-demo", agent_label="demo")
+    assert demo.device_id == "stub-demo"
+    fleet.stop_session(demo.id, session_secret=demo.secret)
+
+
+def test_stop_releases_metadata_handle_not_reregistered_ref(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    original = extra.provider_ref
+    session = fleet.start_session(device_id=extra.id, agent_label="meta")
+    fleet.register_device(
+        device_id=extra.id,
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-99",
+        display_name=extra.display_name,
+    )
+    fleet.stub.ensure("stub-phone-99", extra.display_name)
+    fleet.stop_session(session.id, session_secret=session.secret)
+    assert fleet.stub.health(original) is False
+    assert fleet.stub.health("stub-phone-99") is True
+    kept = fleet.registry.get(extra.id)
+    assert kept.provider_ref == "stub-phone-99"
+
+
+def test_double_stop_does_not_release_new_stub(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    first = fleet.start_session(device_id=extra.id, agent_label="first")
+    first_handle = extra.provider_ref
+    fleet.stop_session(first.id, session_secret=first.secret)
+    again = fleet.stop_session(first.id, session_secret=first.secret)
+    assert again.status.value == "released"
+    replacement = fleet.provision_stub()
+    second = fleet.start_session(device_id=replacement.id, agent_label="second")
+    fleet.stop_session(first.id, session_secret=first.secret)
+    assert fleet.sessions.get(second.id).status.value == "active"
+    assert fleet.stub.health(replacement.provider_ref) is True
+    assert replacement.provider_ref != first_handle or fleet.registry.get(
+        replacement.id
+    )
+    fleet.stop_session(second.id, session_secret=second.secret)
+
+
+def test_cloud_discover_and_live_status(fleet: Fleet) -> None:
+    cloud = FakeCloudProvider()
+    cloud.add("slot-1", "Farm One")
+    fleet.set_cloud_provider(cloud)
+    found = {item.provider_ref for item in fleet.discover(save=True)}
+    assert "slot-1" in found
+    listed = {item.device.id: item.status.value for item in fleet.list_devices()}
+    assert listed["slot-1"] == "online"
+    session = fleet.start_session(device_id="slot-1", agent_label="farm")
+    fleet.stop_session(session.id, session_secret=session.secret)
+    assert cloud.released == ["slot-1"]
+    cloud.devices.clear()
+    fleet.register_device(
+        device_id="slot-gone",
+        provider=ProviderKind.CLOUD,
+        provider_ref="slot-missing",
+        display_name="Gone",
+    )
+    listed = {item.device.id: item.status.value for item in fleet.list_devices()}
+    assert listed["slot-gone"] == "offline"
+    with pytest.raises(FleetError):
+        fleet.start_session(device_id="slot-gone", agent_label="farm")
+
+
+def test_attach_after_stop_does_not_restore_current(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    session = fleet.start_session(device_id=extra.id, agent_label="owner")
+    fleet.stop_session(session.id, session_secret=session.secret)
+    with pytest.raises(SessionError):
+        fleet.attach_session(
+            session.id, agent_label="owner", session_secret=session.secret
+        )
+    assert fleet.current_session_id("owner") is None
+
+
+def test_attach_and_stop_leave_consistent_current(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    session = fleet.start_session(device_id=extra.id, agent_label="owner")
+    errors: list[BaseException] = []
+
+    def stopper() -> None:
+        try:
+            fleet.stop_session(session.id, session_secret=session.secret)
+        except SessionError as exc:
+            errors.append(exc)
+
+    def attacher() -> None:
+        try:
+            fleet.attach_session(
+                session.id, agent_label="owner", session_secret=session.secret
+            )
+        except SessionError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=attacher), threading.Thread(target=stopper)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert fleet.sessions.get(session.id).status.value == "released"
+    assert fleet.current_session_id("owner") is None

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -112,13 +114,18 @@ def run_doctor(fleet: Fleet) -> DoctorReport:
 
 
 def _dir_is_writable(path: Path) -> bool:
-    """True only if we can create and remove a probe file in `path`."""
+    """True only if we can create and remove a unique probe file in `path`."""
     if not path.exists() or not path.is_dir():
         return False
-    probe = path / ".devicefleet-write-probe"
     try:
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
+        fd, name = tempfile.mkstemp(prefix=".devicefleet-write-probe.", dir=str(path))
     except OSError:
         return False
+    try:
+        os.close(fd)
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
     return True

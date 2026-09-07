@@ -10,8 +10,13 @@ from devicefleet.fleet import Fleet
 def test_dir_is_writable_probe(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
+    existing = home / ".devicefleet-write-probe"
+    existing.write_text("keep-me", encoding="utf-8")
     assert _dir_is_writable(home) is True
-    assert (home / ".devicefleet-write-probe").exists() is False
+    assert existing.exists() is True
+    assert existing.read_text(encoding="utf-8") == "keep-me"
+    leftovers = list(home.glob(".devicefleet-write-probe.*"))
+    assert leftovers == []
 
     missing = tmp_path / "gone"
     assert _dir_is_writable(missing) is False

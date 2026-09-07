@@ -344,15 +344,25 @@ def session_list(
 def session_stop(
     ctx: typer.Context,
     session_id: Annotated[Optional[str], typer.Argument()] = None,
+    session_opt: Annotated[
+        Optional[str],
+        typer.Option(
+            "--session",
+            "-s",
+            help="Session id (same as the positional argument; other commands use this flag).",
+        ),
+    ] = None,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Release a session so the device is free again."""
     transport = _transport(ctx)
-    if session_id:
-        resolved = session_id
-    elif isinstance(transport, HttpTransport):
-        raise typer.BadParameter("pass --session / the session id when talking to a remote host")
-    else:
+    resolved = session_id or session_opt
+    if not resolved:
+        if isinstance(transport, HttpTransport):
+            raise typer.BadParameter(
+                "pass the session id as a positional argument "
+                "(`session stop ses_…`) or `--session`"
+            )
         resolved = transport.current_session_id()
     if not resolved:
         raise typer.BadParameter("session id required (or start a session first as this agent)")

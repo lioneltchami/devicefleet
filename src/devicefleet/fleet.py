@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from devicefleet.config import Settings, load_settings
@@ -499,8 +500,8 @@ class Fleet:
         return False
 
     def _lease_lock(self, device_id: str) -> ExclusiveFileLock:
-        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in device_id)
-        return ExclusiveFileLock(self.settings.home / "locks" / f"{safe}.lock")
+        digest = hashlib.sha256(device_id.strip().encode("utf-8")).hexdigest()
+        return ExclusiveFileLock(self.settings.home / "locks" / f"{digest}.lock")
 
     def _provision_lock(self) -> ExclusiveFileLock:
         return ExclusiveFileLock(self.settings.home / "locks" / "provision-stub.lock")

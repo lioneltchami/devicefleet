@@ -221,6 +221,30 @@ def test_duplicate_ref_rejected_at_fleet(fleet: Fleet) -> None:
         )
 
 
+def test_long_device_id_lease_lock_is_bounded(fleet: Fleet) -> None:
+    long_id = "phone-" + ("x" * 300)
+    other_id = "phone-" + ("y" * 300)
+    fleet.register_device(
+        device_id=long_id,
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-long",
+    )
+    lock = fleet._lease_lock(long_id)
+    assert len(lock.path.name.encode("utf-8")) <= 255
+    assert fleet._lease_lock(long_id).path == lock.path
+    assert fleet._lease_lock(other_id).path != lock.path
+    session = fleet.start_session(device_id=long_id, agent_label="long-id")
+    fleet.stop_session(
+        session.id, agent_label="long-id", session_secret=session.secret
+    )
+    fleet.register_device(
+        device_id=long_id,
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-long-b",
+    )
+    fleet.remove_device(long_id)
+
+
 def test_concurrent_start_session_single_lease(fleet: Fleet) -> None:
     extra = fleet.provision_stub()
     winners: list[str] = []

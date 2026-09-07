@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 from devicefleet.models import CloudDeviceSpec, DeviceStatus, DiscoveredDevice, ProviderKind
 from devicefleet.pngutil import solid_png
 from devicefleet.providers.base import CloudDeviceProvider, DeviceProvider, ProviderError
 from devicefleet.store import YamlStore
+
+T = TypeVar("T")
 
 DEFAULT_WIDTH = 1080
 DEFAULT_HEIGHT = 1920
@@ -62,27 +66,31 @@ class StubCloudProvider(DeviceProvider):
     def discover(self) -> list[DiscoveredDevice]:
         return [
             self._as_discovered(phone)
-            for phone in self._phones.values()
+            for phone in self._phones_snapshot().values()
             if not phone.released
         ]
 
     def screenshot(self, handle: str) -> bytes:
-        phone = self._require(handle)
-        phone.log("screenshot")
-        self._persist()
-        return solid_png(
-            phone.width,
-            phone.height,
-            color=(28, 32, 40),
-            mark=phone.last_tap,
-        )
+        def apply(phones: dict[str, _VirtualPhone]) -> bytes:
+            phone = _require_phone(phones, handle)
+            phone.log("screenshot")
+            return solid_png(
+                phone.width,
+                phone.height,
+                color=(28, 32, 40),
+                mark=phone.last_tap,
+            )
+
+        return self._mutate(apply)
 
     def tap(self, handle: str, x: int, y: int) -> None:
-        phone = self._require(handle)
-        self._in_bounds(phone, x, y)
-        phone.last_tap = (x, y)
-        phone.log(f"tap {x},{y}")
-        self._persist()
+        def apply(phones: dict[str, _VirtualPhone]) -> None:
+            phone = _require_phone(phones, handle)
+            self._in_bounds(phone, x, y)
+            phone.last_tap = (x, y)
+            phone.log(f"tap {x},{y}")
+
+        self._mutate(apply)
 
     def swipe(
         self,
@@ -93,53 +101,64 @@ class StubCloudProvider(DeviceProvider):
         y2: int,
         duration_ms: int = 300,
     ) -> None:
-        phone = self._require(handle)
-        self._in_bounds(phone, x1, y1)
-        self._in_bounds(phone, x2, y2)
         if duration_ms < 1:
             raise ValueError("duration_ms must be >= 1")
-        phone.last_tap = (x2, y2)
-        phone.log(f"swipe {x1},{y1}->{x2},{y2} {duration_ms}ms")
-        self._persist()
+
+        def apply(phones: dict[str, _VirtualPhone]) -> None:
+            phone = _require_phone(phones, handle)
+            self._in_bounds(phone, x1, y1)
+            self._in_bounds(phone, x2, y2)
+            phone.last_tap = (x2, y2)
+            phone.log(f"swipe {x1},{y1}->{x2},{y2} {duration_ms}ms")
+
+        self._mutate(apply)
 
     def type_text(self, handle: str, text: str) -> None:
         if text is None:
             raise ValueError("text is required")
-        phone = self._require(handle)
-        phone.last_text = (phone.last_text + text)[-MAX_TEXT:]
-        phone.log(f"type {text!r}")
-        self._persist()
+
+        def apply(phones: dict[str, _VirtualPhone]) -> None:
+            phone = _require_phone(phones, handle)
+            phone.last_text = (phone.last_text + text)[-MAX_TEXT:]
+            phone.log(f"type {text!r}")
+
+        self._mutate(apply)
 
     def keyevent(self, handle: str, key: str) -> None:
         if not key or not str(key).strip():
             raise ValueError("key is required")
-        phone = self._require(handle)
-        phone.last_key = str(key).strip().upper()
-        if phone.last_key == "HOME":
-            phone.focused = "home"
-        elif phone.last_key == "BACK":
-            phone.focused = "previous"
-        phone.log(f"key {phone.last_key}")
-        self._persist()
+
+        def apply(phones: dict[str, _VirtualPhone]) -> None:
+            phone = _require_phone(phones, handle)
+            phone.last_key = str(key).strip().upper()
+            if phone.last_key == "HOME":
+                phone.focused = "home"
+            elif phone.last_key == "BACK":
+                phone.focused = "previous"
+            phone.log(f"key {phone.last_key}")
+
+        self._mutate(apply)
 
     def dump_ui(self, handle: str) -> str:
-        phone = self._require(handle)
-        phone.log("dump_ui")
-        self._persist()
-        tap = phone.last_tap or (0, 0)
-        return (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            f'<hierarchy rotation="0" focused="{phone.focused}">\n'
-            f'  <node class="android.widget.FrameLayout" bounds="[0,0][{phone.width},{phone.height}]" text="">\n'
-            f'    <node class="android.widget.TextView" text="Devicefleet stub" bounds="[80,120][1000,220]"/>\n'
-            f'    <node class="android.widget.Button" text="Continue" bounds="[300,1600][780,1740]"/>\n'
-            f'    <node class="stub.Cursor" text="last_tap" bounds="[{tap[0]},{tap[1]}][{tap[0]+1},{tap[1]+1}]"/>\n'
-            "  </node>\n"
-            "</hierarchy>\n"
-        )
+        def apply(phones: dict[str, _VirtualPhone]) -> str:
+            phone = _require_phone(phones, handle)
+            phone.log("dump_ui")
+            tap = phone.last_tap or (0, 0)
+            return (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                f'<hierarchy rotation="0" focused="{phone.focused}">\n'
+                f'  <node class="android.widget.FrameLayout" bounds="[0,0][{phone.width},{phone.height}]" text="">\n'
+                f'    <node class="android.widget.TextView" text="Devicefleet stub" bounds="[80,120][1000,220]"/>\n'
+                f'    <node class="android.widget.Button" text="Continue" bounds="[300,1600][780,1740]"/>\n'
+                f'    <node class="stub.Cursor" text="last_tap" bounds="[{tap[0]},{tap[1]}][{tap[0]+1},{tap[1]+1}]"/>\n'
+                "  </node>\n"
+                "</hierarchy>\n"
+            )
+
+        return self._mutate(apply)
 
     def describe(self, handle: str) -> dict[str, str]:
-        phone = self._require(handle)
+        phone = _require_phone(self._phones_snapshot(), handle)
         return {
             "handle": phone.handle,
             "provider": self.provider_id,
@@ -163,35 +182,44 @@ class StubCloudProvider(DeviceProvider):
         """
         if spec.platform != "android":
             raise ProviderError("StubCloudProvider only simulates Android")
-        handle = self._next_handle(reserved_ids)
-        name = spec.model or f"Stub Cloud Phone {handle}"
-        phone = _VirtualPhone(handle=handle, display_name=name)
-        self._phones[handle] = phone
-        phone.log(f"provisioned platform={spec.platform}")
-        self._persist()
-        return self._as_discovered(phone, tags=list(spec.tags))
+
+        def apply(phones: dict[str, _VirtualPhone]) -> DiscoveredDevice:
+            handle = self._next_handle(reserved_ids, phones=phones)
+            name = spec.model or f"Stub Cloud Phone {handle}"
+            phone = _VirtualPhone(handle=handle, display_name=name)
+            phones[handle] = phone
+            phone.log(f"provisioned platform={spec.platform}")
+            return self._as_discovered(phone, tags=list(spec.tags))
+
+        return self._mutate(apply)
 
     def ensure(self, handle: str, display_name: str | None = None) -> None:
         """Rehydrate a registry stub so leftover YAML devices stay usable."""
         if not handle or not handle.strip():
             raise ValueError("device handle is required")
-        phone = self._phones.get(handle)
-        if phone is None:
-            self._phones[handle] = _VirtualPhone(
-                handle=handle,
-                display_name=display_name or handle,
-            )
-            self._persist()
-            return
-        if phone.released:
-            phone.released = False
-            phone.log("rehydrated")
-            if display_name:
-                phone.display_name = display_name
-            self._persist()
 
-    def _next_handle(self, reserved_ids: set[str] | None = None) -> str:
-        taken = set(self._phones)
+        def apply(phones: dict[str, _VirtualPhone]) -> None:
+            phone = phones.get(handle)
+            if phone is None:
+                phones[handle] = _VirtualPhone(
+                    handle=handle,
+                    display_name=display_name or handle,
+                )
+                return
+            if phone.released:
+                phone.released = False
+                phone.log("rehydrated")
+                if display_name:
+                    phone.display_name = display_name
+
+        self._mutate(apply)
+
+    def _next_handle(
+        self,
+        reserved_ids: set[str] | None = None,
+        phones: dict[str, _VirtualPhone] | None = None,
+    ) -> str:
+        taken = set(self._phones if phones is None else phones)
         if reserved_ids:
             taken |= reserved_ids
         index = 1
@@ -202,26 +230,54 @@ class StubCloudProvider(DeviceProvider):
             index += 1
 
     def release_cloud(self, handle: str) -> None:
-        phone = self._require(handle)
-        phone.released = True
-        phone.log("released")
-        self._persist()
+        def apply(phones: dict[str, _VirtualPhone]) -> None:
+            phone = _require_phone(phones, handle)
+            phone.released = True
+            phone.log("released")
+
+        self._mutate(apply)
 
     def health(self, handle: str) -> bool:
-        phone = self._phones.get(handle)
+        phone = self._phones_snapshot().get(handle)
         return phone is not None and not phone.released
 
     def action_log(self, handle: str) -> list[str]:
         """Test helper: recorded actions on a virtual phone."""
-        return list(self._require(handle).actions)
+        return list(_require_phone(self._phones_snapshot(), handle).actions)
 
     def _require(self, handle: str) -> _VirtualPhone:
-        if not handle or not handle.strip():
-            raise ValueError("device handle is required")
-        phone = self._phones.get(handle)
-        if phone is None or phone.released:
-            raise ProviderError(f"stub device not available: {handle}")
-        return phone
+        return _require_phone(self._phones_snapshot(), handle)
+
+    def _phones_snapshot(self) -> dict[str, _VirtualPhone]:
+        """Return phones from disk when a store is configured, else memory."""
+        if self._store is None:
+            return self._phones
+        phones = _phones_from_document(self._store.load())
+        if not phones:
+            phones = _default_phones()
+        self._phones = phones
+        return phones
+
+    def _mutate(self, apply: Callable[[dict[str, _VirtualPhone]], T]) -> T:
+        """Apply a mutation to the latest on-disk phone map, then persist it.
+
+        Reloads from the store inside the lock so a process with a stale
+        in-memory snapshot cannot resurrect a handle another process released.
+        """
+        if self._store is None:
+            return apply(self._phones)
+
+        def mutator(document: dict[str, object]) -> T:
+            phones = _phones_from_document(document)
+            if not phones:
+                phones = _default_phones()
+            result = apply(phones)
+            document.clear()
+            document["phones"] = [_phone_to_dict(phone) for phone in phones.values()]
+            self._phones = phones
+            return result
+
+        return self._store.update(mutator)
 
     @staticmethod
     def _in_bounds(phone: _VirtualPhone, x: int, y: int) -> None:
@@ -231,14 +287,6 @@ class StubCloudProvider(DeviceProvider):
             raise ValueError(
                 f"point ({x},{y}) is outside {phone.width}x{phone.height}"
             )
-
-    def _persist(self) -> None:
-        if self._store is None:
-            return
-        payload: dict[str, object] = {
-            "phones": [_phone_to_dict(phone) for phone in self._phones.values()]
-        }
-        self._store.save(payload)
 
     @staticmethod
     def _as_discovered(
@@ -295,19 +343,32 @@ def _phone_from_dict(raw: dict[str, object]) -> _VirtualPhone:
     )
 
 
-def _load_phones(store: YamlStore | None) -> dict[str, _VirtualPhone]:
-    if store is None:
-        return _default_phones()
-    document = store.load()
+def _require_phone(phones: dict[str, _VirtualPhone], handle: str) -> _VirtualPhone:
+    if not handle or not handle.strip():
+        raise ValueError("device handle is required")
+    phone = phones.get(handle)
+    if phone is None or phone.released:
+        raise ProviderError(f"stub device not available: {handle}")
+    return phone
+
+
+def _phones_from_document(document: dict[str, object]) -> dict[str, _VirtualPhone]:
     raw_phones = document.get("phones")
     if not isinstance(raw_phones, list) or not raw_phones:
-        return _default_phones()
+        return {}
     phones: dict[str, _VirtualPhone] = {}
     for item in raw_phones:
         if not isinstance(item, dict):
             continue
         phone = _phone_from_dict(item)
         phones[phone.handle] = phone
+    return phones
+
+
+def _load_phones(store: YamlStore | None) -> dict[str, _VirtualPhone]:
+    if store is None:
+        return _default_phones()
+    phones = _phones_from_document(store.load())
     return phones or _default_phones()
 
 

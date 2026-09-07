@@ -245,6 +245,32 @@ def test_concurrent_start_session_single_lease(fleet: Fleet) -> None:
     assert fleet.sessions.active_for_device(extra.id) is not None
 
 
+def test_concurrent_start_session_retries_other_idle_device(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    winners: list[str] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def attempt(label: str) -> None:
+        try:
+            barrier.wait()
+            session = fleet.start_session(tags=["stub"], agent_label=label)
+            winners.append(session.device_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=attempt, args=("alice",)),
+        threading.Thread(target=attempt, args=("bob",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    assert set(winners) == {"stub-demo", extra.id}
+
+
 def test_run_after_stop_cannot_fire(fleet: Fleet) -> None:
     session = fleet.start_session(device_id="stub-demo", agent_label="racer")
     fleet.stop_session(session.id, agent_label="racer", session_secret=session.secret)

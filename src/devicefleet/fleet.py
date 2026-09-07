@@ -248,24 +248,49 @@ class Fleet:
         tags: list[str] | None = None,
         agent_label: str = "anonymous",
     ) -> SessionRecord:
-        device = self._select_idle_device(device_id=device_id, tags=tags)
+        """Lease the first idle match, retrying other matches if that one is taken."""
         label = agent_label.strip() or "anonymous"
-        with self._lease_lock(device.id):
-            fresh = self.registry.get(device.id)
-            if not self._is_leaseable(fresh):
-                busy = self.sessions.active_for_device(fresh.id)
-                if busy is not None:
-                    raise DeviceBusyError(
-                        f"device {fresh.id} is held by session {busy.id} ({busy.agent_label})"
+        attempted: set[str] = set()
+        seen_busy = False
+        while True:
+            candidates = self.registry.find(device_id=device_id, tags=tags)
+            if not candidates:
+                hint = device_id or (",".join(tags or []) or "any")
+                raise DeviceNotFoundError(f"no registered device matches {hint}")
+            idle = [
+                device
+                for device in candidates
+                if device.id not in attempted and self._is_leaseable(device)
+            ]
+            if not idle:
+                if device_id and (seen_busy or self.sessions.active_for_device(candidates[0].id)):
+                    raise DeviceBusyError(f"device {device_id} is already leased")
+                raise FleetError(
+                    "all matching devices are leased or unavailable; "
+                    "stop a session or pick a different id/tag"
+                )
+            device = idle[0]
+            attempted.add(device.id)
+            with self._lease_lock(device.id):
+                try:
+                    fresh = self.registry.get(device.id)
+                except DeviceNotFoundError:
+                    continue
+                if not self._is_leaseable(fresh):
+                    if self.sessions.active_for_device(fresh.id) is not None:
+                        seen_busy = True
+                    continue
+                try:
+                    session = self.sessions.start(
+                        fresh.id,
+                        agent_label=label,
+                        metadata=_session_device_metadata(fresh),
                     )
-                raise FleetError(f"device {fresh.id} is not available to lease")
-            session = self.sessions.start(
-                fresh.id,
-                agent_label=label,
-                metadata=_session_device_metadata(fresh),
-            )
-            self._set_current_session(session.id, label)
-            return session
+                except DeviceBusyError:
+                    seen_busy = True
+                    continue
+                self._set_current_session(session.id, label)
+                return session
 
     def attach_session(
         self,

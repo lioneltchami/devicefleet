@@ -60,3 +60,14 @@ def test_provision_and_release() -> None:
     assert provider.health(extra.provider_ref)
     provider.release_cloud(extra.provider_ref)
     assert provider.health(extra.provider_ref) is False
+
+
+def test_stale_process_persist_does_not_resurrect_released_phone(tmp_path) -> None:
+    path = tmp_path / "stub.yaml"
+    first = StubCloudProvider(state_path=path)
+    extra = first.provision(CloudDeviceSpec())
+    stale = StubCloudProvider(state_path=path)
+    first.release_cloud(extra.provider_ref)
+    stale.tap("stub-phone-1", 1, 1)
+    reloaded = StubCloudProvider(state_path=path)
+    assert reloaded.health(extra.provider_ref) is False

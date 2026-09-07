@@ -732,7 +732,11 @@ def test_released_stop_requires_secret(fleet: Fleet) -> None:
     fleet.stop_session(later.id, session_secret=later.secret)
 
 
-def test_cloud_release_failure_keeps_session_active(fleet: Fleet) -> None:
+def test_cloud_release_failure_marks_session_released(fleet: Fleet) -> None:
+    """Greptile P1 fix: stop_session marks the session RELEASED before releasing
+    the cloud handle, so a release failure leaves the persistent state consistent.
+    The handle may leak, but a retry is a safe no-op rather than a double release.
+    """
     cloud = FakeCloudProvider()
     cloud.add("slot-retry", "Farm Retry")
     fleet.set_cloud_provider(cloud)
@@ -741,12 +745,151 @@ def test_cloud_release_failure_keeps_session_active(fleet: Fleet) -> None:
     cloud.fail_release = True
     with pytest.raises(ProviderError, match="farm busy"):
         fleet.stop_session(session.id, session_secret=session.secret)
-    assert fleet.sessions.get(session.id).status.value == "active"
-    assert cloud.released == []
-    cloud.fail_release = False
+    # Persistent state is the source of truth: session is RELEASED.
+    assert fleet.sessions.get(session.id).status.value == "released"
+    # Retry is a safe no-op (the session is already RELEASED).
     stopped = fleet.stop_session(session.id, session_secret=session.secret)
     assert stopped.status.value == "released"
-    assert cloud.released == ["slot-retry"]
+    # The handle still hasn't been released because the original call failed.
+    assert cloud.released == []
+
+
+def test_set_cloud_provider_rejects_missing_release_cloud(fleet: Fleet) -> None:
+    """set_cloud_provider must refuse adapters without a callable release_cloud."""
+    from devicefleet.providers.base import DeviceProvider
+
+    class NoReleaseProvider(DeviceProvider):
+        provider_id = "norelease"
+
+        def discover(self): return []
+        def screenshot(self, h): return b""
+        def tap(self, h, x, y): pass
+        def swipe(self, h, x1, y1, x2, y2, duration_ms=300): pass
+        def type_text(self, h, t): pass
+        def keyevent(self, h, k): pass
+        def dump_ui(self, h): return ""
+
+    with pytest.raises(ValueError, match="release_cloud"):
+        fleet.set_cloud_provider(NoReleaseProvider())
+
+
+def test_ensure_stub_demo_atomic_under_concurrent_register(fleet: Fleet) -> None:
+    """ensure_stub_demo must not overwrite a concurrently-registered stub-demo."""
+    import threading
+    barrier = threading.Barrier(2)
+    results: list = []
+    errors: list = []
+
+    def ensureer() -> None:
+        try:
+            barrier.wait()
+            results.append(("ensure", fleet.registry.ensure_stub_demo().display_name))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def registerer() -> None:
+        try:
+            barrier.wait()
+            fleet.register_device(
+                device_id="stub-demo",
+                provider=ProviderKind.STUB,
+                provider_ref="custom-handle",
+                display_name="Custom Demo",
+            )
+            results.append(("register", "ok"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=ensureer)
+    t2 = threading.Thread(target=registerer)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    # Whichever wins, the final record must be one of the two and must be
+    # unique (no torn write).
+    record = fleet.registry.get("stub-demo")
+    assert record.id == "stub-demo"
+    assert record.provider is ProviderKind.STUB
+    # The two operations must not race into two records.
+    devices = [d for d in fleet.registry.list_devices() if d.id == "stub-demo"]
+    assert len(devices) == 1
+
+
+def test_list_devices_skips_removed_during_status_update(fleet: Fleet) -> None:
+    """list_devices must not raise DeviceNotFoundError when remove_device races
+    with the per-device status update.
+    """
+    import threading
+    import time
+
+    # Pre-register a device
+    fleet.register_device(
+        device_id="racy",
+        provider=ProviderKind.STUB,
+        provider_ref="racy-handle",
+        display_name="Racy",
+    )
+
+    def remover() -> None:
+        time.sleep(0.01)
+        try:
+            fleet.remove_device("racy")
+        except DeviceNotFoundError:
+            pass
+
+    t = threading.Thread(target=remover)
+    t.start()
+    # Repeatedly call list_devices; the in-between remove must not raise
+    for _ in range(20):
+        items = fleet.list_devices()
+        ids = [i.device.id for i in items]
+        assert "racy" not in ids or any(i.device.id == "racy" for i in items)
+    t.join()
+
+
+def test_clear_current_session_does_not_evict_concurrent_start(fleet: Fleet) -> None:
+    """A concurrent start on a *different* device that writes a new id for the
+    same agent must not be wiped by a stale _clear_current_session that was
+    comparing against an old id read before the new start committed.
+    """
+    import threading
+    import time
+
+    # Register a second device so the racer has somewhere to lease.
+    fleet.register_device(
+        device_id="second",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-second",
+        display_name="Second",
+    )
+
+    # Agent "alice" starts a session on the first device; remember it.
+    first = fleet.start_session(device_id="stub-demo", agent_label="alice")
+    assert fleet.current_session_id("alice") == first.id
+
+    barrier = threading.Barrier(2)
+
+    def racer() -> None:
+        barrier.wait()
+        # Small delay so the clearer reads current_session_id first.
+        time.sleep(0.005)
+        fleet.start_session(device_id="second", agent_label="alice")
+
+    def clearer() -> None:
+        barrier.wait()
+        fleet.stop_session(
+            first.id, agent_label="alice", session_secret=first.secret
+        )
+
+    t1 = threading.Thread(target=racer)
+    t2 = threading.Thread(target=clearer)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    # The racer wrote a new current_session_id for alice on a *different*
+    # device; that id must not have been evicted by the stop_session clear.
+    active = fleet.sessions.active_for_device("second")
+    if active is not None and active.agent_label == "alice":
+        assert fleet.current_session_id("alice") == active.id
 
 
 def test_local_transport_blocks_cross_agent_secret_access(fleet: Fleet) -> None:

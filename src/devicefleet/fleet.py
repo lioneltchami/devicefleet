@@ -61,6 +61,11 @@ class Fleet:
         """Install a real hosted-phone adapter. Stub is never used for CLOUD."""
         if provider is None:
             raise ValueError("cloud provider is required")
+        # Adapters without a working `release_cloud` would leak the hosted
+        # handle on every stop, so refuse to install them. Callers that want
+        # a non-releasing provider can pass a no-op method.
+        if not callable(getattr(provider, "release_cloud", None)):
+            raise ValueError("cloud provider must implement release_cloud")
         self._cloud_provider = provider
 
     def provider_for(self, kind: ProviderKind) -> DeviceProvider:
@@ -153,8 +158,16 @@ class Fleet:
                         (device.provider, device.provider_ref), DeviceStatus.UNKNOWN
                     )
                 if status is not DeviceStatus.BUSY and status != device.last_status:
-                    self.registry.set_status(device.id, status)
-                    device = self.registry.get(device.id)
+                    # Hold the per-device lease lock so a concurrent
+                    # `remove_device` cannot delete the record between our
+                    # `set_status` and `get` calls (the registry's own file
+                    # lock prevents partial writes, not racing deletions).
+                    with self._lease_lock(device.id):
+                        try:
+                            self.registry.set_status(device.id, status)
+                            device = self.registry.get(device.id)
+                        except DeviceNotFoundError:
+                            continue
             items.append(
                 DeviceListItem(
                     device=device,
@@ -347,11 +360,22 @@ class Fleet:
                 # now exists for the device. Do not touch it.
                 self._clear_current_session(current.id, current.agent_label)
                 return current
-            # Release the cloud handle BEFORE marking the session released.
-            # If the release raises, the session stays active so the caller
-            # can retry without losing the lease.
-            self._release_cloud_handle(current)
+            # Mark RELEASED first so the persistent state is the source of
+            # truth. If the cloud release then fails, the session is already
+            # RELEASED; a retry becomes a no-op and the only consequence is
+            # that the hosted handle leaks (the operator must reconcile the
+            # farm). The previous "release first" order left the session
+            # ACTIVE with no handle, breaking actions and double-releasing.
             result = self.sessions.stop(session_id)
+            try:
+                self._release_cloud_handle(result.session)
+            except Exception:
+                # The persistent state is already consistent; surface the
+                # release failure but keep the RELEASED transition.
+                self._clear_current_session(
+                    result.session.id, result.session.agent_label
+                )
+                raise
             self._clear_current_session(result.session.id, result.session.agent_label)
             return result.session
 
@@ -567,9 +591,23 @@ class Fleet:
         self.state_store.update(mutator)
 
     def _clear_current_session(self, session_id: str, agent_label: str) -> None:
-        current = self.current_session_id(agent_label)
-        if current == session_id:
-            self._set_current_session(None, agent_label)
+        # Read-then-write would race with a concurrent session start that
+        # writes a new id for this agent in between; the stale check would
+        # then delete the freshly-set id. Compare and remove inside one
+        # store-level mutator so the check and the write are atomic.
+        agent = agent_label.strip() or "anonymous"
+
+        def mutator(document: dict[str, object]) -> None:
+            mapping = document.get("current_sessions")
+            if not isinstance(mapping, dict):
+                return
+            if mapping.get(agent) != session_id:
+                return
+            merged: dict[str, object] = dict(mapping)
+            merged.pop(agent, None)
+            document["current_sessions"] = merged
+
+        self.state_store.update(mutator)
 
     def _write_artifact(self, session_id: str, name: str, data: bytes) -> Path:
         folder = self.settings.artifacts_dir / session_id

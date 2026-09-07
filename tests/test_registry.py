@@ -234,3 +234,28 @@ def test_upsert_strips_provider_ref_whitespace(tmp_path: Path) -> None:
     # Now register a different id with the same ref — must be rejected as duplicate
     with pytest.raises(DuplicateDeviceError):
         registry.register("phone-b", ProviderKind.STUB, "h1")
+
+
+def test_upsert_normalizes_legacy_padded_provider_ref(tmp_path: Path) -> None:
+    """upsert must normalize existing legacy records too, so a prior " h1 "
+    cannot coexist with a new "h1" after upgrade."""
+    registry = _registry(tmp_path)
+    # Pre-seed a legacy record with padded provider_ref directly on disk
+    legacy = DeviceRecord(
+        id="old",
+        display_name="Old",
+        provider=ProviderKind.STUB,
+        provider_ref=" h1 ",  # padded
+    )
+    store = YamlStore(tmp_path / "devices.yaml")
+    store.save({"devices": [legacy.model_dump(mode="json")]})
+
+    # Upsert a new device with the same normalized provider_ref
+    new = DeviceRecord(
+        id="new",
+        display_name="New",
+        provider=ProviderKind.STUB,
+        provider_ref="h1",
+    )
+    with pytest.raises(DuplicateDeviceError, match="already registered as old"):
+        registry.upsert(new)

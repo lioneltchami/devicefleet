@@ -80,7 +80,13 @@ class DeviceRegistry:
         normalized = device.model_copy(update={"provider_ref": device.provider_ref.strip()})
 
         def mutator(document: dict[str, object]) -> DeviceRecord:
-            devices = [item for item in self._parse(document) if item.id != normalized.id]
+            # Normalize legacy records too: a previously persisted " h1 " must
+            # match the new "h1" when we run the dedupe check below.
+            devices = [
+                item.model_copy(update={"provider_ref": item.provider_ref.strip()})
+                for item in self._parse(document)
+                if item.id != normalized.id
+            ]
             _reject_duplicate_ref(devices, normalized)
             devices.append(normalized)
             devices.sort(key=lambda item: item.registered_at)
@@ -226,20 +232,27 @@ class DeviceRegistry:
 
     def ensure_stub_demo(self) -> DeviceRecord:
         """Create the demo device if missing; never overwrite an existing id."""
-        try:
-            existing = self.get("stub-demo")
-        except DeviceNotFoundError:
-            existing = None
-        if existing is not None:
-            return existing
-        return self.register(
-            device_id="stub-demo",
+        target = DeviceRecord(
+            id="stub-demo",
+            display_name="Stub Demo Phone",
             provider=ProviderKind.STUB,
             provider_ref="stub-phone-1",
-            display_name="Stub Demo Phone",
             tags=["demo", "stub", "android"],
             notes="Virtual device from StubCloudProvider. No hardware required.",
         )
+
+        def mutator(document: dict[str, object]) -> DeviceRecord:
+            devices = self._parse(document)
+            for device in devices:
+                if device.id == target.id:
+                    return device
+            devices.append(target)
+            devices.sort(key=lambda item: item.registered_at)
+            document.clear()
+            document.update(self._dump(devices))
+            return target
+
+        return self._store.update(mutator)
 
 
 def _reject_duplicate_ref(others: list[DeviceRecord], candidate: DeviceRecord) -> None:

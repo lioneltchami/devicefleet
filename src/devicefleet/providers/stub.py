@@ -1,0 +1,204 @@
+"""In-memory hosted phone used for demos and tests. No credentials required."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from devicefleet.models import CloudDeviceSpec, DeviceStatus, DiscoveredDevice, ProviderKind
+from devicefleet.pngutil import solid_png
+from devicefleet.providers.base import CloudDeviceProvider, DeviceProvider, ProviderError
+
+DEFAULT_WIDTH = 1080
+DEFAULT_HEIGHT = 1920
+DEFAULT_HANDLE = "stub-phone-1"
+
+
+@dataclass
+class _VirtualPhone:
+    handle: str
+    display_name: str
+    width: int = DEFAULT_WIDTH
+    height: int = DEFAULT_HEIGHT
+    last_tap: tuple[int, int] | None = None
+    last_text: str = ""
+    last_key: str = ""
+    released: bool = False
+    actions: list[str] = field(default_factory=list)
+    focused: str = "home"
+
+    def log(self, message: str) -> None:
+        self.actions.append(message)
+
+
+class StubCloudProvider(DeviceProvider):
+    """Reference CloudDeviceProvider: a fake Android that records actions.
+
+    Use this when you have no USB phone and no paid device-farm account.
+    Production farms should copy the method signatures, not this in-memory
+    implementation.
+    """
+
+    provider_id = "stub"
+
+    def __init__(self) -> None:
+        self._phones: dict[str, _VirtualPhone] = {
+            DEFAULT_HANDLE: _VirtualPhone(
+                handle=DEFAULT_HANDLE,
+                display_name="Stub Demo Phone",
+            )
+        }
+
+    def discover(self) -> list[DiscoveredDevice]:
+        return [
+            self._as_discovered(phone)
+            for phone in self._phones.values()
+            if not phone.released
+        ]
+
+    def screenshot(self, handle: str) -> bytes:
+        phone = self._require(handle)
+        phone.log("screenshot")
+        return solid_png(
+            phone.width,
+            phone.height,
+            color=(28, 32, 40),
+            mark=phone.last_tap,
+        )
+
+    def tap(self, handle: str, x: int, y: int) -> None:
+        phone = self._require(handle)
+        self._in_bounds(phone, x, y)
+        phone.last_tap = (x, y)
+        phone.log(f"tap {x},{y}")
+
+    def swipe(
+        self,
+        handle: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        duration_ms: int = 300,
+    ) -> None:
+        phone = self._require(handle)
+        self._in_bounds(phone, x1, y1)
+        self._in_bounds(phone, x2, y2)
+        if duration_ms < 1:
+            raise ValueError("duration_ms must be >= 1")
+        phone.last_tap = (x2, y2)
+        phone.log(f"swipe {x1},{y1}->{x2},{y2} {duration_ms}ms")
+
+    def type_text(self, handle: str, text: str) -> None:
+        if text is None:
+            raise ValueError("text is required")
+        phone = self._require(handle)
+        phone.last_text += text
+        phone.log(f"type {text!r}")
+
+    def keyevent(self, handle: str, key: str) -> None:
+        if not key or not str(key).strip():
+            raise ValueError("key is required")
+        phone = self._require(handle)
+        phone.last_key = str(key).strip().upper()
+        if phone.last_key == "HOME":
+            phone.focused = "home"
+        elif phone.last_key == "BACK":
+            phone.focused = "previous"
+        phone.log(f"key {phone.last_key}")
+
+    def dump_ui(self, handle: str) -> str:
+        phone = self._require(handle)
+        phone.log("dump_ui")
+        tap = phone.last_tap or (0, 0)
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<hierarchy rotation="0" focused="{phone.focused}">\n'
+            f'  <node class="android.widget.FrameLayout" bounds="[0,0][{phone.width},{phone.height}]" text="">\n'
+            f'    <node class="android.widget.TextView" text="Devicefleet stub" bounds="[80,120][1000,220]"/>\n'
+            f'    <node class="android.widget.Button" text="Continue" bounds="[300,1600][780,1740]"/>\n'
+            f'    <node class="stub.Cursor" text="last_tap" bounds="[{tap[0]},{tap[1]}][{tap[0]+1},{tap[1]+1}]"/>\n'
+            "  </node>\n"
+            "</hierarchy>\n"
+        )
+
+    def describe(self, handle: str) -> dict[str, str]:
+        phone = self._require(handle)
+        return {
+            "handle": phone.handle,
+            "provider": self.provider_id,
+            "model": "Devicefleet Stub Phone",
+            "manufacturer": "devicefleet",
+            "width": str(phone.width),
+            "height": str(phone.height),
+            "last_tap": "" if phone.last_tap is None else f"{phone.last_tap[0]},{phone.last_tap[1]}",
+            "actions": str(len(phone.actions)),
+        }
+
+    def provision(self, spec: CloudDeviceSpec) -> DiscoveredDevice:
+        """Allocate another virtual phone. Used to demo cloud acquire."""
+        if spec.platform != "android":
+            raise ProviderError("StubCloudProvider only simulates Android")
+        index = len(self._phones) + 1
+        handle = f"stub-phone-{index}"
+        name = spec.model or f"Stub Cloud Phone {index}"
+        phone = _VirtualPhone(handle=handle, display_name=name)
+        self._phones[handle] = phone
+        phone.log(f"provisioned platform={spec.platform}")
+        return self._as_discovered(phone, tags=list(spec.tags))
+
+    def release_cloud(self, handle: str) -> None:
+        phone = self._require(handle)
+        phone.released = True
+        phone.log("released")
+
+    def health(self, handle: str) -> bool:
+        phone = self._phones.get(handle)
+        return phone is not None and not phone.released
+
+    def action_log(self, handle: str) -> list[str]:
+        """Test helper: recorded actions on a virtual phone."""
+        return list(self._require(handle).actions)
+
+    def _require(self, handle: str) -> _VirtualPhone:
+        if not handle or not handle.strip():
+            raise ValueError("device handle is required")
+        phone = self._phones.get(handle)
+        if phone is None or phone.released:
+            raise ProviderError(f"stub device not available: {handle}")
+        return phone
+
+    @staticmethod
+    def _in_bounds(phone: _VirtualPhone, x: int, y: int) -> None:
+        if not isinstance(x, int) or not isinstance(y, int):
+            raise ValueError("coordinates must be integers")
+        if x < 0 or y < 0 or x >= phone.width or y >= phone.height:
+            raise ValueError(
+                f"point ({x},{y}) is outside {phone.width}x{phone.height}"
+            )
+
+    @staticmethod
+    def _as_discovered(
+        phone: _VirtualPhone, tags: list[str] | None = None
+    ) -> DiscoveredDevice:
+        return DiscoveredDevice(
+            provider=ProviderKind.STUB,
+            provider_ref=phone.handle,
+            display_name=phone.display_name,
+            status=DeviceStatus.ONLINE,
+            metadata={
+                "width": str(phone.width),
+                "height": str(phone.height),
+                "kind": "stub-cloud",
+            },
+            suggested_id="stub-demo" if phone.handle == DEFAULT_HANDLE else phone.handle,
+            suggested_tags=tags or ["demo", "stub", "android"],
+        )
+
+
+# Runtime check: the stub is a valid CloudDeviceProvider.
+def _assert_protocol() -> None:
+    provider: CloudDeviceProvider = StubCloudProvider()
+    assert provider.provider_id == "stub"
+
+
+_assert_protocol()

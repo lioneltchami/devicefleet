@@ -1,0 +1,42 @@
+"""Transport protocol: the CLI talks to either a local Fleet or a remote host."""
+
+from __future__ import annotations
+
+from typing import Protocol
+
+from devicefleet.models import (
+    ActionRequest,
+    ActionResult,
+    DeviceListItem,
+    DiscoveredDevice,
+    SessionRecord,
+)
+
+
+class FleetTransport(Protocol):
+    """Everything an agent CLI needs, independent of process locality."""
+
+    def discover(self, save: bool = False) -> list[DiscoveredDevice]: ...
+
+    def list_devices(
+        self, tags: list[str] | None = None
+    ) -> list[DeviceListItem]: ...
+
+    def start_session(
+        self,
+        device_id: str | None = None,
+        tags: list[str] | None = None,
+        agent_label: str = "anonymous",
+    ) -> SessionRecord: ...
+
+    def attach_session(
+        self, session_id: str, agent_label: str | None = None
+    ) -> SessionRecord: ...
+
+    def list_sessions(self, active_only: bool = False) -> list[SessionRecord]: ...
+
+    def stop_session(self, session_id: str) -> SessionRecord: ...
+
+    def run(self, session_id: str, request: ActionRequest) -> ActionResult: ...
+
+    def current_session_id(self) -> str | None: ...

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 from devicefleet.config import Settings, load_settings
@@ -354,15 +355,30 @@ class Fleet:
                 # If we cannot record the current-session mapping, the lease
                 # would be orphaned: future CLI commands could not find the
                 # session, but the device would still be held. Roll back the
-                # session so the device is free for retry.
+                # session AND release the provider handle so the device is
+                # free for retry.
                 try:
                     self._set_current_session(session.id, label)
-                except Exception:
+                except Exception as original_exc:
                     try:
-                        self.sessions.stop(session.id)
-                    except Exception:
-                        pass
-                    raise
+                        rollback = self.sessions.stop(
+                            session.id, release_pending=True
+                        )
+                        self._release_cloud_handle(rollback.session)
+                        self.sessions.set_release_pending(session.id, pending=False)
+                    except Exception as rollback_exc:  # pragma: no cover
+                        # The original state-store error wins, but log the
+                        # rollback failure with the session id so the
+                        # operator can clean up manually. We do not have
+                        # the id or secret to give the caller otherwise.
+                        _log.exception(
+                            "start_session rollback failed for session %s on "
+                            "%s; manual cleanup required: %r",
+                            session.id,
+                            session.device_id,
+                            rollback_exc,
+                        )
+                    raise original_exc
                 return session
 
     def attach_session(
@@ -402,37 +418,51 @@ class Fleet:
             # the marker write can never leave a "RELEASED + no marker"
             # state that would skip cloud cleanup on retry.
             result = self.sessions.stop(session_id, release_pending=True)
+            # Clear the marker BEFORE the release so a failure of the
+            # post-release "clear marker" write cannot cause a duplicate
+            # release on retry. If the release itself fails we set the
+            # marker back.
+            self.sessions.set_release_pending(session_id, pending=False)
             try:
                 self._release_cloud_handle(result.session)
             except Exception:
-                # The session is RELEASED and the release_pending marker is
-                # durably set. The next stop_session retry will see the
-                # marker and try the release again.
+                # The session is RELEASED, the release is incomplete, and
+                # the marker is re-set so the next stop_session retry will
+                # try the release again.
+                self.sessions.set_release_pending(session_id, pending=True)
                 self._clear_current_session(
                     result.session.id, result.session.agent_label
                 )
                 raise
-            self.sessions.set_release_pending(session_id, pending=False)
             self._clear_current_session(result.session.id, result.session.agent_label)
             return result.session
 
     def _retry_pending_release(self, session: SessionRecord) -> None:
         """Re-attempt the cloud-handle release for a session that was RELEASED
-        but whose previous release attempt failed. Skip the release if a new
-        lease now owns the same device+handle so we do not stomp on it.
+        but whose previous release attempt failed.
+
+        Three cases:
+        - no active lease on the device: release the old handle.
+        - a new lease on the same device+handle: the new lease owns the
+          handle, skip the release.
+        - a new lease on the same device but a *different* handle: the old
+          handle is still leaked; release it without touching the new
+          lease.
         """
         if session.metadata.get("release_pending") != "true":
             return
         handle = (session.metadata.get("provider_ref") or "").strip()
-        kind = (session.metadata.get("provider") or "").strip()
         if not handle:
             self.sessions.set_release_pending(session.id, pending=False)
             return
         active = self.sessions.active_for_device(session.device_id)
-        if active is not None and active.id != session.id:
-            # A new lease now owns the device. The old handle may or may not
-            # still be ours; releasing through the new adapter could free a
-            # handle the new lease depends on. Abandon the pending release.
+        if (
+            active is not None
+            and active.id != session.id
+            and (active.metadata.get("provider_ref") or "").strip() == handle
+        ):
+            # The new lease now uses the same handle. It owns the handle;
+            # releasing would stomp on the active lease. Abandon.
             self.sessions.set_release_pending(session.id, pending=False)
             return
         try:
@@ -763,6 +793,9 @@ def _session_device_metadata(device: DeviceRecord) -> dict[str, str]:
     if device.metadata.get("provisioned") == "true":
         metadata["provisioned"] = "true"
     return metadata
+
+
+_log = logging.getLogger(__name__)
 
 
 def _is_provisioned(session: SessionRecord) -> bool:

@@ -279,6 +279,33 @@ class SessionManager:
 
         return self._store.update(mutator)
 
+    def mark_release_completed(self, session_id: str) -> SessionRecord:
+        """Mark the cloud-handle release as completed (or attempted) for a
+        session. Used to bound retries so a successful release cannot be
+        repeated after a marker-clear write error, while a process crash
+        before the mark still leaves the session visible to the next retry.
+        """
+        def mutator(document: dict[str, object]) -> SessionRecord:
+            sessions = self._parse(document)
+            found: SessionRecord | None = None
+            for item in sessions:
+                if item.id == session_id:
+                    found = item
+                    break
+            if found is None:
+                raise SessionNotFoundError(f"session not found: {session_id}")
+            metadata = dict(found.metadata)
+            metadata.pop("release_pending", None)
+            metadata["release_done"] = "true"
+            updated = found.model_copy(update={"metadata": metadata})
+            replaced = [item for item in sessions if item.id != session_id]
+            replaced.append(updated)
+            document.clear()
+            document.update(self._dump(replaced))
+            return updated
+
+        return self._store.update(mutator)
+
 
 def _new_session_id() -> str:
     return "ses_" + secrets.token_hex(6)

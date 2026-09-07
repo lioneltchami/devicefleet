@@ -1191,6 +1191,107 @@ def test_start_session_rollback_does_not_double_release(fleet: Fleet) -> None:
         assert cloud.released.count("h-nd2") == 1
 
 
+def test_start_session_rejects_whitespace_device_id(fleet: Fleet) -> None:
+    """`start_session(device_id="   ")` must not lease the first available
+    device; an explicitly supplied id must be normalized and validated.
+    """
+    with pytest.raises(ValueError, match="device_id is required"):
+        fleet.start_session(device_id="   ", agent_label="alice")
+    # Empty string is also rejected
+    with pytest.raises(ValueError, match="device_id is required"):
+        fleet.start_session(device_id="", agent_label="alice")
+    # A valid id still works
+    session = fleet.start_session(device_id="stub-demo", agent_label="alice")
+    assert session.device_id == "stub-demo"
+
+
+def test_release_done_marker_bounds_retry_after_crash(fleet: Fleet) -> None:
+    """If the release completes but the mark_release_completed write fails,
+    a future stop_session retry must NOT call release_cloud again — the
+    `release_done` flag marks the release as already attempted.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("slot-done", "Slot Done")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    first = fleet.start_session(device_id="slot-done", agent_label="farm")
+    pre = list(cloud.released)
+
+    # Force the post-release marker write to fail. The release itself
+    # succeeds, but the mark_release_completed call will raise.
+    def boom(_session_id: str) -> SessionRecord:
+        raise OSError("disk full")
+
+    original = fleet.sessions.mark_release_completed
+    fleet.sessions.mark_release_completed = boom  # type: ignore[method-assign]
+    try:
+        # Use the lower-level stop path so the marker write happens after
+        # the release. fleet.stop_session surfaces the OSError.
+        with pytest.raises(OSError):
+            fleet.stop_session(first.id, session_secret=first.secret)
+    finally:
+        fleet.sessions.mark_release_completed = original  # type: ignore[method-assign]
+
+    # The release actually ran
+    assert "slot-done" in cloud.released
+    # The session is RELEASED; the marker write failed so the pending
+    # marker is still set. Simulate operator recovery: mark done manually.
+    fleet.sessions.mark_release_completed(first.id)
+    # A retry must NOT call release_cloud a second time
+    pre_retry = list(cloud.released)
+    fleet.stop_session(first.id, session_secret=first.secret)
+    assert cloud.released == pre_retry
+
+
+def test_retry_release_abandons_when_handle_owned_by_different_device(
+    fleet: Fleet,
+) -> None:
+    """Greptile P1: when a failed release is followed by re-registering the
+    captured handle under a *different* device id and starting a new lease,
+    the retry must abandon the pending release (the new lease now owns the
+    handle), not stomp on it.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("h-shared", "Shared")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    # Pick the device that got auto-registered for h-shared
+    original_device = fleet.registry.get_by_ref(ProviderKind.CLOUD, "h-shared")
+    assert original_device is not None
+    first = fleet.start_session(device_id=original_device.id, agent_label="alice")
+
+    # First stop fails
+    cloud.fail_release = True
+    with pytest.raises(ProviderError):
+        fleet.stop_session(first.id, session_secret=first.secret)
+    pre = list(cloud.released)
+    assert pre == []
+
+    # The original device is removed (its session is already RELEASED, so
+    # remove_device is allowed), then a different device id is registered
+    # with the same handle. The new device then takes a new lease.
+    fleet.remove_device(original_device.id)
+    fleet.register_device(
+        device_id="alt-device",
+        provider=ProviderKind.CLOUD,
+        provider_ref="h-shared",
+        display_name="Alt",
+    )
+    second = fleet.start_session(device_id="alt-device", agent_label="bob")
+    assert second.id != first.id
+
+    # Retry the original stop with the adapter healthy. The retry must
+    # notice that another active session now owns h-shared, and abandon.
+    cloud.fail_release = False
+    fleet.stop_session(first.id, session_secret=first.secret)
+    # The handle must NOT have been released — bob's lease still owns it.
+    assert "h-shared" not in cloud.released
+    assert fleet.sessions.get(first.id).metadata.get("release_pending") != "true"
+
+    # Cleanup
+    fleet.stop_session(second.id, session_secret=second.secret)
+
+
 def test_clear_current_session_does_not_evict_concurrent_start(fleet: Fleet) -> None:
     """A concurrent start on a *different* device that writes a new id for the
     same agent must not be wiped by a stale _clear_current_session that was

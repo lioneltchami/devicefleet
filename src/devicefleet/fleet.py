@@ -312,6 +312,14 @@ class Fleet:
         agent_label: str = "anonymous",
     ) -> SessionRecord:
         """Lease the first idle match, retrying other matches if that one is taken."""
+        # Normalize and validate an explicitly supplied device_id. Without
+        # this, a whitespace-padded value like "   " would silently fall
+        # through to `DeviceRegistry.find` where the empty stripped form
+        # disables the id filter and leases the first available device.
+        if device_id is not None:
+            device_id = device_id.strip()
+            if not device_id:
+                raise ValueError("device_id is required")
         label = agent_label.strip() or "anonymous"
         attempted: set[str] = set()
         seen_busy = False
@@ -409,31 +417,34 @@ class Fleet:
                 # Idempotent retry: attempt any pending cloud release first
                 # so a transient provider failure does not become a permanent
                 # hosted-handle leak. Bail out if a *new* lease now owns the
-                # device, so we do not release a handle that belongs to it.
+                # handle, so we do not release a handle that belongs to it.
                 self._retry_pending_release(current)
                 self._clear_current_session(current.id, current.agent_label)
                 return current
             # Mark RELEASED + release_pending atomically. The marker is set
             # in the same mutator as the status change, so a disk failure on
             # the marker write can never leave a "RELEASED + no marker"
-            # state that would skip cloud cleanup on retry.
+            # state that would skip cloud cleanup on retry. We use an
+            # at-least-once semantic for the actual release: a process
+            # crash between the release and the "done" marker write is
+            # recovered on the next retry, while a duplicate release is
+            # acceptable for idempotent adapters and bounded by the
+            # `release_done` flag below.
             result = self.sessions.stop(session_id, release_pending=True)
-            # Clear the marker BEFORE the release so a failure of the
-            # post-release "clear marker" write cannot cause a duplicate
-            # release on retry. If the release itself fails we set the
-            # marker back.
-            self.sessions.set_release_pending(session_id, pending=False)
             try:
                 self._release_cloud_handle(result.session)
             except Exception:
-                # The session is RELEASED, the release is incomplete, and
-                # the marker is re-set so the next stop_session retry will
-                # try the release again.
-                self.sessions.set_release_pending(session_id, pending=True)
+                # Release failed. Keep `release_pending=true` so the next
+                # stop_session retry can pick the release back up.
                 self._clear_current_session(
                     result.session.id, result.session.agent_label
                 )
                 raise
+            # Release succeeded. Mark the session as release-done atomically
+            # (in one write) so a future retry that sees `release_done`
+            # knows the release has been attempted. The `release_pending`
+            # marker is cleared in the same write.
+            self.sessions.mark_release_completed(session_id)
             self._clear_current_session(result.session.id, result.session.agent_label)
             return result.session
 
@@ -442,35 +453,42 @@ class Fleet:
         but whose previous release attempt failed.
 
         Three cases:
-        - no active lease on the device: release the old handle.
-        - a new lease on the same device+handle: the new lease owns the
-          handle, skip the release.
-        - a new lease on the same device but a *different* handle: the old
-          handle is still leaked; release it without touching the new
-          lease.
+        - `release_done` is set: the release has been attempted; do not
+          retry (this bounds the duplicate-release window after a
+          process crash between the release and the marker write).
+        - no active session on any device uses the captured handle:
+          release it.
+        - another active session captures the same handle: it owns the
+          handle now, abandon the pending release.
         """
         if session.metadata.get("release_pending") != "true":
+            return
+        if session.metadata.get("release_done") == "true":
             return
         handle = (session.metadata.get("provider_ref") or "").strip()
         if not handle:
             self.sessions.set_release_pending(session.id, pending=False)
             return
-        active = self.sessions.active_for_device(session.device_id)
-        if (
-            active is not None
-            and active.id != session.id
-            and (active.metadata.get("provider_ref") or "").strip() == handle
-        ):
-            # The new lease now uses the same handle. It owns the handle;
-            # releasing would stomp on the active lease. Abandon.
-            self.sessions.set_release_pending(session.id, pending=False)
-            return
+        # Look across ALL active sessions for one that captures this handle.
+        # This catches the case where the handle was re-registered under a
+        # different device id (the old-session device check would miss it).
+        for active in self.sessions.list_sessions(active_only=True):
+            if active.id == session.id:
+                continue
+            active_handle = (active.metadata.get("provider_ref") or "").strip()
+            if (
+                active.metadata.get("provider") == session.metadata.get("provider")
+                and active_handle == handle
+            ):
+                # Another active session owns the handle now.
+                self.sessions.set_release_pending(session.id, pending=False)
+                return
         try:
             self._release_cloud_handle(session)
         except Exception:
             # Leave the marker in place; another retry may succeed.
             return
-        self.sessions.set_release_pending(session.id, pending=False)
+        self.sessions.mark_release_completed(session.id)
 
     def run(
         self,

@@ -547,6 +547,42 @@ def test_concurrent_provision_stub_unique_ids(fleet: Fleet) -> None:
     assert len(refs) == 8
 
 
+def test_discover_save_skips_busy_status(fleet: Fleet) -> None:
+    original = fleet.stub.discover
+
+    def busy_discover() -> list[DiscoveredDevice]:
+        items = original()
+        return [
+            item.model_copy(update={"status": DeviceStatus.BUSY}) for item in items
+        ]
+
+    fleet.stub.discover = busy_discover  # type: ignore[method-assign]
+    found = fleet.discover(save=True)
+    assert found
+    assert all(item.status is DeviceStatus.BUSY for item in found)
+    demo = fleet.registry.get("stub-demo")
+    assert demo.last_status is not DeviceStatus.BUSY
+
+
+def test_discover_save_does_not_resurrect_released_stub(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    stale = DiscoveredDevice(
+        provider=ProviderKind.STUB,
+        provider_ref=extra.provider_ref,
+        display_name=extra.display_name,
+        status=DeviceStatus.ONLINE,
+        metadata=dict(extra.metadata),
+        suggested_id=extra.id,
+        suggested_tags=list(extra.tags),
+    )
+    session = fleet.start_session(device_id=extra.id, agent_label="temp")
+    fleet.stop_session(session.id, session_secret=session.secret)
+    fleet._save_discovered(stale)
+    ids = {item.device.id for item in fleet.list_devices()}
+    assert extra.id not in ids
+    assert fleet.stub.health(extra.provider_ref) is False
+
+
 def test_user_registered_stub_survives_session_stop(fleet: Fleet) -> None:
     custom = fleet.register_device(
         device_id="lab-stub",

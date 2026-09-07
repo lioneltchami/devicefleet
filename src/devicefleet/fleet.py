@@ -92,30 +92,47 @@ class Fleet:
                 pass
         if save:
             for item in found:
-                by_ref = self.registry.get_by_ref(item.provider, item.provider_ref)
-                if by_ref is not None:
-                    self.registry.touch(by_ref.id)
-                    self.registry.set_status(by_ref.id, item.status)
-                    continue
-                device_id = item.suggested_id or item.provider_ref
-                try:
-                    collision = self.registry.get(device_id)
-                except DeviceNotFoundError:
-                    collision = None
-                if collision is not None:
-                    continue
-                self.registry.register(
-                    device_id=device_id,
-                    provider=item.provider,
-                    provider_ref=item.provider_ref,
-                    display_name=item.display_name,
-                    tags=item.suggested_tags,
-                    metadata=item.metadata,
-                    last_status=item.status,
-                )
-                if item.provider is ProviderKind.STUB:
-                    self.stub.ensure(item.provider_ref, item.display_name)
+                self._save_discovered(item)
         return found
+
+    def _save_discovered(self, item: DiscoveredDevice) -> None:
+        """Persist one discovery result without resurrecting a released stub."""
+        persist_status = (
+            None if item.status is DeviceStatus.BUSY else item.status
+        )
+        by_ref = self.registry.get_by_ref(item.provider, item.provider_ref)
+        lock_id = by_ref.id if by_ref is not None else (item.suggested_id or item.provider_ref)
+        with self._lease_lock(lock_id):
+            if item.provider is ProviderKind.STUB and not self.stub.health(
+                item.provider_ref
+            ):
+                return
+            by_ref = self.registry.get_by_ref(item.provider, item.provider_ref)
+            if by_ref is not None:
+                self.registry.touch(by_ref.id)
+                if persist_status is not None:
+                    self.registry.set_status(by_ref.id, persist_status)
+                return
+            device_id = item.suggested_id or item.provider_ref
+            try:
+                collision = self.registry.get(device_id)
+            except DeviceNotFoundError:
+                collision = None
+            if collision is not None:
+                return
+            self.registry.register(
+                device_id=device_id,
+                provider=item.provider,
+                provider_ref=item.provider_ref,
+                display_name=item.display_name,
+                tags=item.suggested_tags,
+                metadata=item.metadata,
+                last_status=persist_status or DeviceStatus.UNKNOWN,
+            )
+            if item.provider is ProviderKind.STUB and self.stub.health(
+                item.provider_ref
+            ):
+                self.stub.ensure(item.provider_ref, item.display_name)
 
     def list_devices(
         self,

@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.python-version
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Tooling
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Devicefleet local state (never commit a live fleet)
+.devicefleet/
+*.png
+!tests/fixtures/**
+
+# Secrets
+.env
+.env.*
+!.env.example

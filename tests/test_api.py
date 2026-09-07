@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+from pathlib import Path
+from urllib.parse import quote
+
+import pytest
+from fastapi.testclient import TestClient
+
+from devicefleet.api.app import create_app
+from devicefleet.fleet import Fleet
+from devicefleet.models import ActionName, ActionRequest
+from devicefleet.store import YamlStore
+from devicefleet.transport.http import HttpTransport, _artifact_basename
+
+
+def _owned(headers: dict[str, str], created: dict) -> dict[str, str]:
+    return {**headers, "X-Devicefleet-Session": created["secret"]}
+
+
+def test_health_and_session_action(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+
+    headers = {"X-Devicefleet-Agent": "api-test"}
+    created = client.post(
+        "/sessions",
+        json={"device_id": "stub-demo", "agent_label": "api-test"},
+        headers=headers,
+    )
+    assert created.status_code == 200
+    session_id = created.json()["id"]
+    owned = _owned(headers, created.json())
+
+    shot = client.post(
+        f"/sessions/{session_id}/actions",
+        json={"name": ActionName.SCREENSHOT.value},
+        headers=owned,
+    )
+    assert shot.status_code == 200
+    assert shot.json()["ok"] is True
+
+    tap = client.post(
+        f"/sessions/{session_id}/actions",
+        json={"name": "tap", "x": 12, "y": 40},
+        headers=owned,
+    )
+    assert tap.status_code == 200
+
+    missing = client.post(
+        "/sessions/ses_missing/actions",
+        json={"name": "tap", "x": 1, "y": 1},
+        headers=owned,
+    )
+    assert missing.status_code == 404
+
+    listed = client.get("/sessions", headers=headers)
+    assert listed.status_code == 200
+    assert "secret" not in listed.json()[0]
+
+    stopped = client.delete(f"/sessions/{session_id}", headers=owned)
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "released"
+
+
+def test_register_and_busy_delete(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    created = client.post(
+        "/devices",
+        json={
+            "device_id": "lab-stub",
+            "provider": "stub",
+            "provider_ref": "stub-phone-4",
+            "display_name": "Lab Stub",
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["id"] == "lab-stub"
+    assert fleet.stub.health("stub-phone-4") is True
+
+    client.post(
+        "/sessions",
+        json={"device_id": "lab-stub", "agent_label": "api-test"},
+        headers={"X-Devicefleet-Agent": "api-test"},
+    )
+    busy = client.delete("/devices/lab-stub")
+    assert busy.status_code == 409
+
+
+def test_action_on_missing_device_is_404(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    headers = {"X-Devicefleet-Agent": "api-test"}
+    created = client.post(
+        "/sessions",
+        json={"device_id": "stub-demo", "agent_label": "api-test"},
+        headers=headers,
+    )
+    session_id = created.json()["id"]
+    owned = _owned(headers, created.json())
+    fleet.registry.remove("stub-demo")
+    action = client.post(
+        f"/sessions/{session_id}/actions",
+        json={"name": "info"},
+        headers=owned,
+    )
+    assert action.status_code == 404
+    stopped = client.delete(f"/sessions/{session_id}", headers=owned)
+    assert stopped.status_code == 200
+
+
+def test_artifact_download_and_http_transport(fleet: Fleet, tmp_path: Path) -> None:
+    client = TestClient(create_app(fleet))
+    headers = {"X-Devicefleet-Agent": "api-test"}
+    created = client.post(
+        "/sessions",
+        json={"device_id": "stub-demo", "agent_label": "api-test"},
+        headers=headers,
+    )
+    session_id = created.json()["id"]
+    owned = _owned(headers, created.json())
+    shot = client.post(
+        f"/sessions/{session_id}/actions",
+        json={"name": ActionName.SCREENSHOT.value},
+        headers=owned,
+    )
+    assert shot.status_code == 200
+    name = Path(shot.json()["artifact_path"]).name
+
+    stolen = client.get(
+        f"/sessions/{session_id}/artifacts/{name}",
+        headers={"X-Devicefleet-Agent": "thief"},
+    )
+    assert stolen.status_code == 403
+
+    downloaded = client.get(
+        f"/sessions/{session_id}/artifacts/{name}",
+        headers=owned,
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    traversal = client.get(
+        f"/sessions/{session_id}/artifacts/..%2Fdevices.yaml",
+        headers=owned,
+    )
+    assert traversal.status_code in {400, 404}
+
+    dest = tmp_path / "client-artifacts"
+    dest.mkdir()
+    transport = HttpTransport("http://test", artifacts_dir=dest, agent_label="api-test")
+
+    def fake_request(method: str, path: str, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, params, session_id
+        if path.endswith("/actions"):
+            return shot.json()
+        raise AssertionError(path)
+
+    def fake_bytes(method: str, path: str, session_id: str | None = None) -> bytes:
+        del method
+        assert path == f"/sessions/{session_id}/artifacts/{name}"
+        return downloaded.content
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    transport._request_bytes = fake_bytes  # type: ignore[method-assign]
+    result = transport.run(session_id, ActionRequest(name=ActionName.SCREENSHOT))
+    assert Path(result.artifact_path or "").exists()
+    assert dest in Path(result.artifact_path or "").parents
+    assert Path(result.artifact_path or "").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_artifact_basename_accepts_windows_and_posix_paths() -> None:
+    assert (
+        _artifact_basename(r"C:\Users\fleet\artifacts\sess\screenshot.png")
+        == "screenshot.png"
+    )
+    assert _artifact_basename("/tmp/artifacts/sess/screenshot.png") == "screenshot.png"
+    assert _artifact_basename("screenshot.png") == "screenshot.png"
+
+
+def test_http_transport_downloads_windows_artifact_path(tmp_path: Path) -> None:
+    dest = tmp_path / "client-artifacts"
+    dest.mkdir()
+    transport = HttpTransport("http://test", artifacts_dir=dest, agent_label="api-test")
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    windows_path = r"C:\Users\fleet\artifacts\sess-1\screenshot.png"
+
+    def fake_request(method: str, path: str, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, params, session_id, json
+        if path.endswith("/actions"):
+            return {
+                "ok": True,
+                "action": ActionName.SCREENSHOT.value,
+                "session_id": "sess-1",
+                "device_id": "stub-demo",
+                "message": "screenshot",
+                "artifact_path": windows_path,
+                "payload": {"path": windows_path},
+            }
+        raise AssertionError(path)
+
+    def fake_bytes(method: str, path: str, session_id: str | None = None) -> bytes:
+        del method
+        assert path == f"/sessions/{session_id}/artifacts/screenshot.png"
+        return png
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    transport._request_bytes = fake_bytes  # type: ignore[method-assign]
+    result = transport.run("sess-1", ActionRequest(name=ActionName.SCREENSHOT))
+    local = Path(result.artifact_path or "")
+    assert local.name == "screenshot.png"
+    assert dest in local.parents
+    assert local.read_bytes() == png
+
+
+def test_http_attach_does_not_persist_bad_secret(tmp_path: Path) -> None:
+    store = YamlStore(tmp_path / "state.yaml")
+    transport = HttpTransport("http://test", secret_store=store)
+
+    def boom(method, path, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, path, json, params, session_id
+        raise RuntimeError("invalid session secret")
+
+    transport._request = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="invalid session secret"):
+        transport.attach_session("ses_bad", session_secret="cap_wrong")
+    assert "ses_bad" not in transport.session_secrets
+    assert store.load().get("session_secrets") in (None, {})
+
+
+def test_duplicate_and_cloud_register(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    first = client.post(
+        "/devices",
+        json={
+            "device_id": "a",
+            "provider": "stub",
+            "provider_ref": "stub-phone-4",
+        },
+    )
+    assert first.status_code == 200
+    dup = client.post(
+        "/devices",
+        json={
+            "device_id": "b",
+            "provider": "stub",
+            "provider_ref": "stub-phone-4",
+        },
+    )
+    assert dup.status_code == 409
+    cloud = client.post(
+        "/devices",
+        json={
+            "device_id": "cloud-1",
+            "provider": "cloud",
+            "provider_ref": "slot-1",
+        },
+    )
+    assert cloud.status_code == 409
+
+
+def test_list_devices_preserves_comma_in_tag(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    created = client.post(
+        "/devices",
+        json={
+            "device_id": "comma-tag",
+            "provider": "stub",
+            "provider_ref": "stub-phone-6",
+            "tags": ["ios,lab"],
+        },
+    )
+    assert created.status_code == 200
+    matched = client.get("/devices", params=[("tag", "ios,lab")])
+    assert matched.status_code == 200
+    ids = [item["device"]["id"] for item in matched.json()]
+    assert "comma-tag" in ids
+    split = client.get("/devices", params={"tag": "ios"})
+    assert split.status_code == 200
+    split_ids = [item["device"]["id"] for item in split.json()]
+    assert "comma-tag" not in split_ids
+
+
+def test_remove_device_with_slash_id(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    created = client.post(
+        "/devices",
+        json={
+            "device_id": "lab/a",
+            "provider": "stub",
+            "provider_ref": "stub-phone-3",
+            "display_name": "Slash",
+        },
+    )
+    assert created.status_code == 200
+    removed = client.delete(f"/devices/{quote('lab/a', safe='')}")
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["id"] == "lab/a"
+
+
+def test_http_transport_encodes_tags_and_device_ids() -> None:
+    transport = HttpTransport("http://test")
+    seen: dict[str, object] = {}
+
+    def fake_request(method, path, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del json, session_id
+        seen["method"] = method
+        seen["path"] = path
+        seen["params"] = params
+        if method == "GET":
+            return []
+        return {
+            "id": "lab/a",
+            "display_name": "Slash",
+            "provider": "stub",
+            "provider_ref": "h1",
+            "tags": [],
+            "metadata": {},
+            "registered_at": "2024-01-01T00:00:00+00:00",
+            "last_status": "unknown",
+            "notes": "",
+        }
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    transport.list_devices(tags=["ios,lab", "android"])
+    assert seen["params"] == [("tag", "ios,lab"), ("tag", "android")]
+    transport.remove_device("lab/a")
+    assert seen["path"] == "/devices/lab%2Fa"
+
+
+def test_http_transport_retains_start_agent_label() -> None:
+    transport = HttpTransport("http://test", agent_label="anonymous")
+    seen: dict[str, object] = {}
+
+    def fake_request(method, path, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, path, params, session_id
+        seen["json"] = json
+        return {
+            "id": "ses_abc123",
+            "device_id": "stub-demo",
+            "agent_label": "worker-a",
+            "status": "active",
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "secret": "cap_test",
+            "metadata": {},
+        }
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    session = transport.start_session(device_id="stub-demo", agent_label="worker-a")
+    assert session.agent_label == "worker-a"
+    assert transport.agent_label == "worker-a"
+    payload = seen["json"]
+    assert isinstance(payload, dict)
+    assert payload["agent_label"] == "worker-a"

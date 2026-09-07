@@ -180,14 +180,13 @@ class Fleet:
             raise FleetError(
                 "cannot register a CLOUD device until a cloud adapter is configured"
             )
-        if provider is ProviderKind.STUB:
-            with self._provision_lock():
-                return self._register_device_body(
-                    device_id, provider, provider_ref, display_name, tags, metadata, notes
-                )
-        return self._register_device_body(
-            device_id, provider, provider_ref, display_name, tags, metadata, notes
-        )
+        # All registrations share the provision lock so a concurrent caller
+        # cannot register a colliding id during provision_stub's
+        # allocate-then-register window.
+        with self._provision_lock():
+            return self._register_device_body(
+                device_id, provider, provider_ref, display_name, tags, metadata, notes
+            )
 
     def _register_device_body(
         self,
@@ -344,12 +343,17 @@ class Fleet:
             current = self.sessions.get(session_id)
             self.sessions.authorize(current, session_secret, agent_label)
             if current.status is SessionStatus.RELEASED:
+                # Idempotent retry: the cloud handle is owned by whatever lease
+                # now exists for the device. Do not touch it.
                 self._clear_current_session(current.id, current.agent_label)
                 return current
+            # Release the cloud handle BEFORE marking the session released.
+            # If the release raises, the session stays active so the caller
+            # can retry without losing the lease.
             self._release_cloud_handle(current)
-            session = self.sessions.stop(session_id)
-            self._clear_current_session(session.id, session.agent_label)
-            return session
+            result = self.sessions.stop(session_id)
+            self._clear_current_session(result.session.id, result.session.agent_label)
+            return result.session
 
     def run(
         self,

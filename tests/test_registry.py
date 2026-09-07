@@ -216,3 +216,21 @@ def test_ensure_stub_demo_does_not_overwrite_existing(tmp_path: Path) -> None:
     assert kept.provider is ProviderKind.ADB
     assert kept.provider_ref == "SERIAL-1"
     assert kept.display_name == "Not Stub"
+
+
+def test_upsert_strips_provider_ref_whitespace(tmp_path: Path) -> None:
+    """Regression: `upsert` must normalize provider_ref the same way `register` does."""
+    registry = _registry(tmp_path)
+    registry.register("phone-a", ProviderKind.STUB, "h1", display_name="A")
+    updated = registry.upsert(
+        DeviceRecord(
+            id="phone-a",
+            display_name="A",
+            provider=ProviderKind.STUB,
+            provider_ref=" h1 ",
+        )
+    )
+    assert updated.provider_ref == "h1"
+    # Now register a different id with the same ref — must be rejected as duplicate
+    with pytest.raises(DuplicateDeviceError):
+        registry.register("phone-b", ProviderKind.STUB, "h1")

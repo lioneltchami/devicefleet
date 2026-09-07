@@ -74,14 +74,19 @@ class DeviceRegistry:
     def upsert(self, device: DeviceRecord) -> DeviceRecord:
         """Insert or replace a device with the same id."""
 
+        # Normalize provider_ref the same way `register`/`get_by_ref` do, so a
+        # value like " h1 " cannot produce a duplicate record distinct from
+        # an existing "h1" entry.
+        normalized = device.model_copy(update={"provider_ref": device.provider_ref.strip()})
+
         def mutator(document: dict[str, object]) -> DeviceRecord:
-            devices = [item for item in self._parse(document) if item.id != device.id]
-            _reject_duplicate_ref(devices, device)
-            devices.append(device)
+            devices = [item for item in self._parse(document) if item.id != normalized.id]
+            _reject_duplicate_ref(devices, normalized)
+            devices.append(normalized)
             devices.sort(key=lambda item: item.registered_at)
             document.clear()
             document.update(self._dump(devices))
-            return device
+            return normalized
 
         return self._store.update(mutator)
 

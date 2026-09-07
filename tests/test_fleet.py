@@ -311,6 +311,52 @@ def test_run_after_stop_cannot_fire(fleet: Fleet) -> None:
         )
 
 
+def test_register_device_serializes_with_provision_stub(fleet: Fleet) -> None:
+    """Regression: register_device must share the provision lock with provision_stub
+    so a concurrent register cannot sneak an id into the snapshot-to-register window.
+    """
+    errors: list[BaseException] = []
+    provisioned: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def provisioner() -> None:
+        try:
+            barrier.wait()
+            record = fleet.provision_stub()
+            provisioned.append(record.id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def registrator() -> None:
+        try:
+            barrier.wait()
+            # Pre-register the well-known demo id while provision_stub runs.
+            # With the lock, this serializes cleanly with provision_stub.
+            fleet.register_device(
+                device_id="my-device",
+                provider=ProviderKind.STUB,
+                provider_ref="stub-phone-known",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=provisioner),
+        threading.Thread(target=registrator),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert len(provisioned) == 1
+    # Both operations must produce stable, distinct records.
+    record = fleet.registry.get("my-device")
+    assert record.provider_ref == "stub-phone-known"
+    extra_id = provisioned[0]
+    assert extra_id != "my-device"
+
+
 def test_run_and_stop_serialized(fleet: Fleet) -> None:
     session = fleet.start_session(device_id="stub-demo", agent_label="lock")
     gate = threading.Event()
@@ -701,3 +747,120 @@ def test_cloud_release_failure_keeps_session_active(fleet: Fleet) -> None:
     stopped = fleet.stop_session(session.id, session_secret=session.secret)
     assert stopped.status.value == "released"
     assert cloud.released == ["slot-retry"]
+
+
+def test_local_transport_blocks_cross_agent_secret_access(fleet: Fleet) -> None:
+    """Regression: LocalTransport must not reveal a session's secret to another agent
+    that shares the same DEVICEFLEET_HOME.
+    """
+    from devicefleet.transport.local import LocalTransport
+
+    session = fleet.start_session(device_id="stub-demo", agent_label="alice")
+    # Verify the secret is in the persisted record
+    persisted = fleet.sessions.get(session.id)
+    assert persisted.secret == session.secret
+
+    # Same home, different agent label
+    intruder = LocalTransport(fleet, agent_label="bob")
+    with pytest.raises(SessionOwnershipError, match="belongs to alice"):
+        intruder.run(
+            session.id,
+            ActionRequest(name=ActionName.INFO),
+        )
+    with pytest.raises(SessionOwnershipError, match="belongs to alice"):
+        intruder.stop_session(session.id)
+
+
+def test_state_yaml_preserves_remote_secrets_across_local_start(fleet: Fleet) -> None:
+    """Regression: a local session start must not delete remote capability secrets
+    persisted in state.yaml by an earlier remote CLI invocation.
+    """
+    # Simulate a remote CLI having remembered a secret in state.yaml
+    from devicefleet.store import YamlStore
+    from devicefleet.transport.http import HttpTransport
+
+    state = YamlStore(fleet.settings.state_path)
+    state.update(
+        lambda doc: doc.update(
+            {"session_secrets": {"ses_remote_old": "cap_remote_value"}}
+        )
+    )
+    # Now run a local session start
+    fleet.start_session(device_id="stub-demo", agent_label="alice")
+    # The remote secret must still be there
+    document = state.load()
+    assert document["session_secrets"].get("ses_remote_old") == "cap_remote_value"
+
+
+def test_stop_session_retry_does_not_release_new_handle(fleet: Fleet) -> None:
+    """Regression: a second stop_session on an already-released id must not
+    release a cloud handle that is now bound to a different lease.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("slot-1", "Slot 1")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+
+    # First lease takes slot-1
+    first = fleet.start_session(device_id="slot-1", agent_label="alice")
+    fleet.stop_session(first.id, session_secret=first.secret)
+    assert cloud.released == ["slot-1"]
+
+    # Same cloud phone reappears (e.g. reprovisioned) under a new session id
+    cloud.add("slot-1", "Slot 1")
+    second = fleet.start_session(device_id="slot-1", agent_label="bob")
+    assert second.id != first.id
+
+    # Retrying alice's stop with the now-released id must NOT touch the cloud
+    # handle that is now owned by bob's session.
+    pre_retry_release_calls = len(cloud.released)
+    fleet.stop_session(first.id, session_secret=first.secret)
+    assert len(cloud.released) == pre_retry_release_calls
+    # The active session for bob is still alive
+    assert fleet.sessions.active_for_device("slot-1") is not None
+    assert fleet.sessions.active_for_device("slot-1").agent_label == "bob"
+
+    # Cleanup bob's session — the handle is now released
+    fleet.stop_session(second.id, session_secret=second.secret)
+    assert "slot-1" in cloud.released
+
+
+def test_discover_save_persists_status_for_offline_device(fleet: Fleet) -> None:
+    """Regression: discover(save=True) must retain the OFFLINE status from a backend
+    so list_devices does not default unleased devices to ONLINE.
+    """
+    from devicefleet.providers.base import DeviceProvider
+
+    class OfflineAdb(DeviceProvider):
+        provider_id = "adb"
+
+        def __init__(self) -> None:
+            self.ref = "offline-device-1"
+
+        def discover(self):
+            from devicefleet.models import DiscoveredDevice
+            return [
+                DiscoveredDevice(
+                    provider=ProviderKind.ADB,
+                    provider_ref=self.ref,
+                    display_name="Offline",
+                    status=DeviceStatus.OFFLINE,
+                    suggested_id=self.ref,
+                )
+            ]
+
+        def screenshot(self, handle): return b""
+        def tap(self, handle, x, y): pass
+        def swipe(self, handle, x1, y1, x2, y2, duration_ms=300): pass
+        def type_text(self, handle, text): pass
+        def keyevent(self, handle, key): pass
+        def dump_ui(self, handle): return ""
+        def available(self): return True
+
+    fleet.adb = OfflineAdb()
+    fleet.discover(save=True)
+    record = fleet.registry.get("offline-device-1")
+    assert record.last_status is DeviceStatus.OFFLINE
+    items = fleet.list_devices()
+    item = next(i for i in items if i.device.id == "offline-device-1")
+    assert item.status is DeviceStatus.OFFLINE

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import secrets
+from dataclasses import dataclass
 from datetime import datetime
 
 from devicefleet.models import SessionRecord, SessionStatus, utcnow
@@ -24,6 +25,19 @@ class DeviceBusyError(SessionError):
 
 class SessionOwnershipError(SessionError):
     """Caller is not the agent that holds this lease."""
+
+
+@dataclass(frozen=True)
+class StopResult:
+    """Outcome of `SessionManager.stop`: the session and whether it transitioned.
+
+    Callers that must release a cloud handle should only do so when
+    `transitioned` is True; an idempotent re-stop must not release a handle
+    that may now belong to a different lease.
+    """
+
+    session: SessionRecord
+    transitioned: bool
 
 
 class SessionManager:
@@ -84,8 +98,15 @@ class SessionManager:
                     raise DeviceBusyError(
                         f"device {device_id} is held by session {item.id} ({item.agent_label})"
                     )
+            # Regenerate until the new id does not collide with an existing
+            # session; otherwise `stop()` would terminate every record with the
+            # matching id, removing a different device's active lease.
+            existing_ids = {item.id for item in sessions}
+            new_id = _new_session_id()
+            while new_id in existing_ids:
+                new_id = _new_session_id()
             session = SessionRecord(
-                id=_new_session_id(),
+                id=new_id,
                 device_id=device_id,
                 agent_label=agent_label.strip() or "anonymous",
                 metadata=metadata or {},
@@ -151,10 +172,15 @@ class SessionManager:
             )
         return session
 
-    def stop(self, session_id: str, when: datetime | None = None) -> SessionRecord:
-        """Release a session so another agent can take the device."""
+    def stop(self, session_id: str, when: datetime | None = None) -> StopResult:
+        """Release a session so another agent can take the device.
 
-        def mutator(document: dict[str, object]) -> SessionRecord:
+        Returns the session and a `transitioned` flag; the flag is False on an
+        idempotent re-stop so callers do not release resources they did not
+        actually acquire this call.
+        """
+
+        def mutator(document: dict[str, object]) -> tuple[SessionRecord, bool]:
             sessions = self._parse(document)
             found: SessionRecord | None = None
             for item in sessions:
@@ -164,7 +190,7 @@ class SessionManager:
             if found is None:
                 raise SessionNotFoundError(f"session not found: {session_id}")
             if found.status == SessionStatus.RELEASED:
-                return found
+                return found, False
             updated = found.model_copy(
                 update={
                     "status": SessionStatus.RELEASED,
@@ -175,9 +201,10 @@ class SessionManager:
             replaced.append(updated)
             document.clear()
             document.update(self._dump(replaced))
-            return updated
+            return updated, True
 
-        return self._store.update(mutator)
+        session, transitioned = self._store.update(mutator)
+        return StopResult(session=session, transitioned=transitioned)
 
     def touch(self, session_id: str, when: datetime | None = None) -> SessionRecord:
         """Record that an action ran on this session."""

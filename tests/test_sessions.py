@@ -79,3 +79,63 @@ def test_concurrent_start_one_winner(tmp_path: Path) -> None:
     assert len(winners) == 1
     assert len(errors) == 9
     assert manager.active_for_device("shared-phone") is not None
+
+
+def test_stop_returns_transitioned_flag(tmp_path: Path) -> None:
+    """Regression: stop() must signal real transition vs. idempotent no-op."""
+    manager = _manager(tmp_path)
+    session = manager.start("phone-1", agent_label="owner")
+    first = manager.stop(session.id)
+    assert first.transitioned is True
+    # Second call is a no-op
+    second = manager.stop(session.id)
+    assert second.transitioned is False
+    assert second.session.id == first.session.id
+    # Different device still works after a no-op stop
+    third = manager.start("phone-2", agent_label="owner")
+    assert third.id != session.id
+
+
+def test_duplicate_session_ids_are_avoided(tmp_path: Path) -> None:
+    """Regression: start() must not reuse an id from an existing session."""
+    from devicefleet.sessions import _new_session_id
+
+    manager = _manager(tmp_path)
+    # Pre-seed an existing session id and force the next random id to collide
+    forced = _new_session_id()
+    # Insert a released session with a known id by reaching into the store
+    from devicefleet.models import SessionRecord, SessionStatus
+
+    seed = SessionRecord(
+        id=forced,
+        device_id="old-device",
+        agent_label="old",
+        status=SessionStatus.RELEASED,
+        secret="cap_old",
+    )
+    store = manager._store
+    document = store.load()
+    document["sessions"] = [seed.model_dump(mode="json")]
+    store.save(document)
+
+    # Monkey-patch _new_session_id to collide once, then return a fresh id
+    real = _new_session_id
+    calls = {"n": 0}
+
+    def maybe_collide() -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return forced
+        return real()
+
+    import devicefleet.sessions as s_module
+
+    s_module._new_session_id = maybe_collide
+    try:
+        session = manager.start("new-device", agent_label="new")
+    finally:
+        s_module._new_session_id = real
+    assert session.id != forced
+    # Both sessions must coexist
+    assert manager.get(forced).device_id == "old-device"
+    assert manager.get(session.id).device_id == "new-device"

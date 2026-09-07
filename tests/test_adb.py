@@ -1,6 +1,19 @@
 from __future__ import annotations
 
-from devicefleet.providers.adb import _adb_input_escape, _parse_adb_devices, _resolve_key
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from devicefleet.providers.adb import (
+    LocalAdbProvider,
+    _adb_input_escape,
+    _parse_adb_devices,
+    _resolve_key,
+    type_segments,
+)
+from devicefleet.providers.base import ProviderError, ProviderUnavailableError
 
 
 def test_parse_adb_devices_sample() -> None:
@@ -29,5 +42,39 @@ ABCD                   unauthorized usb:1-2
 
 def test_input_escape_and_keys() -> None:
     assert _adb_input_escape("hello world") == "hello%sworld"
+    assert _adb_input_escape("`cmd`") == "%60cmd%60"
+    assert _adb_input_escape("hello%s") == "hello%25s"
+    assert _adb_input_escape("100%") == "100%25"
+    with pytest.raises(ValueError, match="newline"):
+        _adb_input_escape("hello\n")
+    assert type_segments("a\nb") == [("text", "a"), ("key", "ENTER"), ("text", "b")]
+    assert type_segments("line\n") == [("text", "line"), ("key", "ENTER")]
     assert _resolve_key("BACK") == "4"
     assert _resolve_key("66") == "66"
+
+
+def test_available_requires_executable(tmp_path: Path) -> None:
+    missing = tmp_path / "no-such-adb"
+    assert LocalAdbProvider(adb_bin=str(missing)).available() is False
+
+    blob = tmp_path / "adb-blob"
+    blob.write_text("#!/bin/sh\n", encoding="utf-8")
+    blob.chmod(0o644)
+    assert os.access(blob, os.X_OK) is False
+    assert LocalAdbProvider(adb_bin=str(blob)).available() is False
+
+    blob.chmod(0o755)
+    assert LocalAdbProvider(adb_bin=str(blob)).available() is True
+
+
+def test_run_maps_os_errors(tmp_path: Path) -> None:
+    provider = LocalAdbProvider(adb_bin=str(tmp_path / "adb"))
+    with patch("devicefleet.providers.adb.subprocess.run", side_effect=FileNotFoundError("gone")):
+        with pytest.raises(ProviderUnavailableError):
+            provider._run(["devices"], serial=None)
+    with patch("devicefleet.providers.adb.subprocess.run", side_effect=PermissionError("denied")):
+        with pytest.raises(ProviderError, match="permission denied"):
+            provider._run(["devices"], serial=None)
+    with patch("devicefleet.providers.adb.subprocess.run", side_effect=OSError("bad fd")):
+        with pytest.raises(ProviderError, match="cannot execute adb"):
+            provider._run(["devices"], serial=None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from devicefleet import __version__
@@ -18,7 +19,7 @@ from devicefleet.models import (
     SessionRecord,
 )
 from devicefleet.providers.base import ProviderError
-from devicefleet.registry import DeviceNotFoundError
+from devicefleet.registry import DeviceNotFoundError, DuplicateDeviceError
 from devicefleet.sessions import DeviceBusyError, SessionError, SessionNotFoundError, SessionOwnershipError
 
 
@@ -41,8 +42,8 @@ class RegisterDeviceBody(BaseModel):
     provider: ProviderKind
     provider_ref: str
     display_name: str | None = None
-    tags: list[str] = Field(default_factory=list)
-    notes: str = ""
+    tags: list[str] | None = None
+    notes: str | None = None
 
 
 def _http_error(exc: Exception) -> HTTPException:
@@ -50,7 +51,7 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, (SessionNotFoundError, DeviceNotFoundError)):
         return HTTPException(status_code=404, detail=str(exc))
-    if isinstance(exc, (DeviceBusyError, DeviceInUseError, FleetError)):
+    if isinstance(exc, (DeviceBusyError, DeviceInUseError, DuplicateDeviceError, FleetError)):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, (SessionError, ProviderError, ValueError)):
         return HTTPException(status_code=400, detail=str(exc))
@@ -96,7 +97,7 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
                 tags=body.tags,
                 notes=body.notes,
             )
-        except ValueError as exc:
+        except (ValueError, FleetError, DuplicateDeviceError) as exc:
             raise _http_error(exc) from exc
 
     @protected.delete("/devices/{device_id}", response_model=DeviceRecord)
@@ -147,6 +148,20 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
             SessionError,
         ) as exc:
             raise _http_error(exc) from exc
+
+    @protected.get("/sessions/{session_id}/artifacts/{name}")
+    def get_session_artifact(
+        session_id: str, name: str, request: Request
+    ) -> FileResponse:
+        agent = agent_from_headers(request)
+        try:
+            host_fleet.sessions.require_owner(session_id, agent)
+            path = host_fleet.artifact_file(session_id, name)
+        except (SessionNotFoundError, SessionOwnershipError, ValueError) as exc:
+            raise _http_error(exc) from exc
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"artifact not found: {name}")
+        return FileResponse(path)
 
     @protected.post("/sessions/{session_id}/actions", response_model=ActionResult)
     def run_action(session_id: str, body: ActionRequest, request: Request) -> ActionResult:

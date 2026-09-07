@@ -70,6 +70,17 @@ class DeviceRecord(BaseModel):
             raise ValueError("device id must not contain whitespace")
         return cleaned
 
+    @field_validator("registered_at", "last_seen", mode="before")
+    @classmethod
+    def _utc_datetimes(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        return value
+
     @field_validator("tags")
     @classmethod
     def _normalize_tags(cls, value: list[str]) -> list[str]:

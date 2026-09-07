@@ -31,8 +31,7 @@ class SessionManager:
     def __init__(self, store: YamlStore) -> None:
         self._store = store
 
-    def _read_all(self) -> list[SessionRecord]:
-        document = self._store.load()
+    def _parse(self, document: dict[str, object]) -> list[SessionRecord]:
         raw_items = document.get("sessions", [])
         if raw_items is None:
             return []
@@ -40,10 +39,11 @@ class SessionManager:
             raise ValueError("sessions.yaml must contain a list under 'sessions'")
         return [SessionRecord.model_validate(item) for item in raw_items]
 
-    def _write_all(self, sessions: list[SessionRecord]) -> None:
-        self._store.save(
-            {"sessions": [session.model_dump(mode="json") for session in sessions]}
-        )
+    def _dump(self, sessions: list[SessionRecord]) -> dict[str, object]:
+        return {"sessions": [session.model_dump(mode="json") for session in sessions]}
+
+    def _read_all(self) -> list[SessionRecord]:
+        return self._parse(self._store.load())
 
     def list_sessions(self, active_only: bool = False) -> list[SessionRecord]:
         """Return sessions, newest first."""
@@ -72,24 +72,29 @@ class SessionManager:
         agent_label: str = "anonymous",
         metadata: dict[str, str] | None = None,
     ) -> SessionRecord:
-        """Create a new exclusive session. Fails if the device is already leased."""
+        """Create a new exclusive session. Check-and-save is atomic under the store lock."""
         if not device_id.strip():
             raise ValueError("device_id is required")
-        busy = self.active_for_device(device_id)
-        if busy is not None:
-            raise DeviceBusyError(
-                f"device {device_id} is held by session {busy.id} ({busy.agent_label})"
+
+        def mutator(document: dict[str, object]) -> SessionRecord:
+            sessions = self._parse(document)
+            for item in sessions:
+                if item.device_id == device_id and item.status == SessionStatus.ACTIVE:
+                    raise DeviceBusyError(
+                        f"device {device_id} is held by session {item.id} ({item.agent_label})"
+                    )
+            session = SessionRecord(
+                id=_new_session_id(),
+                device_id=device_id,
+                agent_label=agent_label.strip() or "anonymous",
+                metadata=metadata or {},
             )
-        session = SessionRecord(
-            id=_new_session_id(),
-            device_id=device_id,
-            agent_label=agent_label.strip() or "anonymous",
-            metadata=metadata or {},
-        )
-        sessions = self._read_all()
-        sessions.append(session)
-        self._write_all(sessions)
-        return session
+            sessions.append(session)
+            document.clear()
+            document.update(self._dump(sessions))
+            return session
+
+        return self._store.update(mutator)
 
     def attach(self, session_id: str, agent_label: str | None = None) -> SessionRecord:
         """Rejoin an existing active session. The agent label must match the owner."""
@@ -121,30 +126,54 @@ class SessionManager:
 
     def stop(self, session_id: str, when: datetime | None = None) -> SessionRecord:
         """Release a session so another agent can take the device."""
-        session = self.get(session_id)
-        if session.status == SessionStatus.RELEASED:
-            return session
-        updated = session.model_copy(
-            update={
-                "status": SessionStatus.RELEASED,
-                "released_at": when or utcnow(),
-            }
-        )
-        return self._replace(updated)
+
+        def mutator(document: dict[str, object]) -> SessionRecord:
+            sessions = self._parse(document)
+            found: SessionRecord | None = None
+            for item in sessions:
+                if item.id == session_id:
+                    found = item
+                    break
+            if found is None:
+                raise SessionNotFoundError(f"session not found: {session_id}")
+            if found.status == SessionStatus.RELEASED:
+                return found
+            updated = found.model_copy(
+                update={
+                    "status": SessionStatus.RELEASED,
+                    "released_at": when or utcnow(),
+                }
+            )
+            replaced = [item for item in sessions if item.id != session_id]
+            replaced.append(updated)
+            document.clear()
+            document.update(self._dump(replaced))
+            return updated
+
+        return self._store.update(mutator)
 
     def touch(self, session_id: str, when: datetime | None = None) -> SessionRecord:
         """Record that an action ran on this session."""
-        session = self.get(session_id)
-        if session.status != SessionStatus.ACTIVE:
-            raise SessionError(f"session {session_id} is not active")
-        updated = session.model_copy(update={"last_action_at": when or utcnow()})
-        return self._replace(updated)
 
-    def _replace(self, session: SessionRecord) -> SessionRecord:
-        sessions = [item for item in self._read_all() if item.id != session.id]
-        sessions.append(session)
-        self._write_all(sessions)
-        return session
+        def mutator(document: dict[str, object]) -> SessionRecord:
+            sessions = self._parse(document)
+            found: SessionRecord | None = None
+            for item in sessions:
+                if item.id == session_id:
+                    found = item
+                    break
+            if found is None:
+                raise SessionNotFoundError(f"session not found: {session_id}")
+            if found.status != SessionStatus.ACTIVE:
+                raise SessionError(f"session {session_id} is not active")
+            updated = found.model_copy(update={"last_action_at": when or utcnow()})
+            replaced = [item for item in sessions if item.id != session_id]
+            replaced.append(updated)
+            document.clear()
+            document.update(self._dump(replaced))
+            return updated
+
+        return self._store.update(mutator)
 
 
 def _new_session_id() -> str:

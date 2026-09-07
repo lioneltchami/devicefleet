@@ -60,6 +60,7 @@ class Settings(BaseSettings):
         """Create the data directory tree if it does not exist."""
         self.home.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.home / "locks").mkdir(parents=True, exist_ok=True)
 
 
 def load_settings(home: Path | None = None) -> Settings:

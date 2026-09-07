@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from devicefleet.models import ProviderKind
-from devicefleet.registry import DeviceNotFoundError, DeviceRegistry
+from datetime import datetime, timezone
+
+from devicefleet.models import DeviceRecord, ProviderKind
+from devicefleet.registry import DeviceNotFoundError, DeviceRegistry, DuplicateDeviceError
 from devicefleet.store import YamlStore
 
 
@@ -59,3 +61,63 @@ def test_rejects_whitespace_id(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     with pytest.raises(ValueError):
         registry.register("bad id", ProviderKind.STUB, "x")
+
+
+def test_rejects_duplicate_provider_ref(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.register("phone-a", ProviderKind.ADB, "  SERIAL-1  ")
+    assert registry.get("phone-a").provider_ref == "SERIAL-1"
+    with pytest.raises(DuplicateDeviceError, match="already registered as phone-a"):
+        registry.register("phone-b", ProviderKind.ADB, "SERIAL-1")
+    registry.register("phone-a", ProviderKind.ADB, "SERIAL-1", tags=["lab"])
+    assert registry.get("phone-a").tags == ["lab"]
+
+
+def test_reregister_none_keeps_empty_clears(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.register(
+        "phone-a",
+        ProviderKind.STUB,
+        "h1",
+        tags=["lab", "android"],
+        metadata={"rack": "1"},
+        notes="keep me",
+    )
+    kept = registry.register("phone-a", ProviderKind.STUB, "h1")
+    assert kept.tags == ["lab", "android"]
+    assert kept.metadata == {"rack": "1"}
+    assert kept.notes == "keep me"
+
+    cleared = registry.register(
+        "phone-a",
+        ProviderKind.STUB,
+        "h1",
+        tags=[],
+        metadata={},
+        notes="",
+    )
+    assert cleared.tags == []
+    assert cleared.metadata == {}
+    assert cleared.notes == ""
+
+
+def test_naive_registered_at_becomes_utc() -> None:
+    record = DeviceRecord(
+        id="naive-1",
+        display_name="Naive",
+        provider=ProviderKind.STUB,
+        provider_ref="h1",
+        registered_at=datetime(2024, 1, 15, 12, 0, 0),
+    )
+    assert record.registered_at.tzinfo is not None
+    assert record.registered_at.utcoffset() == timezone.utc.utcoffset(record.registered_at)
+    later = DeviceRecord(
+        id="naive-2",
+        display_name="Later",
+        provider=ProviderKind.STUB,
+        provider_ref="h2",
+        registered_at=datetime(2024, 1, 16, 12, 0, 0),
+    )
+    assert [record.id, later.id] == [
+        item.id for item in sorted([later, record], key=lambda item: item.registered_at)
+    ]

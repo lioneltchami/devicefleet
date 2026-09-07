@@ -58,9 +58,11 @@ devicefleet run dump-ui
 devicefleet run info
 ```
 
-Screenshots and UI XML land under `$DEVICEFLEET_HOME/artifacts/<session>/`. Read those files before guessing coordinates.
+Screenshots and UI XML land under `$DEVICEFLEET_HOME/artifacts/<session>/` on the machine that ran the helper. On `--remote`, the CLI downloads those files from the host into the **local** `$DEVICEFLEET_HOME/artifacts/<session>/` so the agent can read them without SSH. Do not treat the host path in a raw API response as a local file.
 
-`adb shell input text` is ASCII-oriented (spaces become `%s`). Keep typed strings short. Use key events for Back / Home / Enter.
+`adb shell input text` is ASCII-oriented. Spaces become `%s`; `%` and backticks are percent-encoded so they are not rewritten or executed. Newlines are sent as ENTER keyevents. Keep typed strings short. Use key events for Back / Home / Enter.
+
+`devicefleet doctor` inspects the **local** machine only. Do not pass `--remote` to doctor — run it on the fleet host.
 
 Add `--json` to any list/start/run command when you need to parse output.
 

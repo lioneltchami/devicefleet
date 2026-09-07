@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from devicefleet.api.app import create_app
 from devicefleet.fleet import Fleet
-from devicefleet.models import ActionName
+from devicefleet.models import ActionName, ActionRequest
+from devicefleet.transport.http import HttpTransport
 
 
 def test_health_and_session_action(fleet: Fleet) -> None:
@@ -91,3 +94,93 @@ def test_action_on_missing_device_is_404(fleet: Fleet) -> None:
     assert action.status_code == 404
     stopped = client.delete(f"/sessions/{session_id}", headers=headers)
     assert stopped.status_code == 200
+
+
+def test_artifact_download_and_http_transport(fleet: Fleet, tmp_path: Path) -> None:
+    client = TestClient(create_app(fleet))
+    headers = {"X-Devicefleet-Agent": "api-test"}
+    created = client.post(
+        "/sessions",
+        json={"device_id": "stub-demo", "agent_label": "api-test"},
+        headers=headers,
+    )
+    session_id = created.json()["id"]
+    shot = client.post(
+        f"/sessions/{session_id}/actions",
+        json={"name": ActionName.SCREENSHOT.value},
+        headers=headers,
+    )
+    assert shot.status_code == 200
+    name = Path(shot.json()["artifact_path"]).name
+
+    stolen = client.get(
+        f"/sessions/{session_id}/artifacts/{name}",
+        headers={"X-Devicefleet-Agent": "thief"},
+    )
+    assert stolen.status_code == 403
+
+    downloaded = client.get(
+        f"/sessions/{session_id}/artifacts/{name}",
+        headers=headers,
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    traversal = client.get(
+        f"/sessions/{session_id}/artifacts/..%2Fdevices.yaml",
+        headers=headers,
+    )
+    assert traversal.status_code in {400, 404}
+
+    dest = tmp_path / "client-artifacts"
+    dest.mkdir()
+    transport = HttpTransport("http://test", artifacts_dir=dest, agent_label="api-test")
+
+    def fake_request(method: str, path: str, json=None, params=None):  # type: ignore[no-untyped-def]
+        del method, params
+        if path.endswith("/actions"):
+            return shot.json()
+        raise AssertionError(path)
+
+    def fake_bytes(method: str, path: str) -> bytes:
+        del method
+        assert path == f"/sessions/{session_id}/artifacts/{name}"
+        return downloaded.content
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    transport._request_bytes = fake_bytes  # type: ignore[method-assign]
+    result = transport.run(session_id, ActionRequest(name=ActionName.SCREENSHOT))
+    assert Path(result.artifact_path or "").exists()
+    assert dest in Path(result.artifact_path or "").parents
+    assert Path(result.artifact_path or "").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_duplicate_and_cloud_register(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    first = client.post(
+        "/devices",
+        json={
+            "device_id": "a",
+            "provider": "stub",
+            "provider_ref": "stub-phone-4",
+        },
+    )
+    assert first.status_code == 200
+    dup = client.post(
+        "/devices",
+        json={
+            "device_id": "b",
+            "provider": "stub",
+            "provider_ref": "stub-phone-4",
+        },
+    )
+    assert dup.status_code == 409
+    cloud = client.post(
+        "/devices",
+        json={
+            "device_id": "cloud-1",
+            "provider": "cloud",
+            "provider_ref": "slot-1",
+        },
+    )
+    assert cloud.status_code == 409

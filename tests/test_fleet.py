@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
 
 from devicefleet.config import load_settings
-from devicefleet.fleet import DeviceInUseError, Fleet
+from devicefleet.fleet import DeviceInUseError, Fleet, FleetError
 from devicefleet.models import ActionName, ActionRequest, ProviderKind
+from devicefleet.registry import DeviceNotFoundError
+from devicefleet.sessions import DeviceBusyError, SessionError
 
 
 def test_stub_session_helpers_without_hardware(fleet: Fleet) -> None:
@@ -86,3 +89,120 @@ def test_stub_registry_rehydrates_and_provision_avoids_collision(
     extra = second.provision_stub()
     assert extra.provider_ref != "stub-phone-9"
     assert extra.provider_ref != "stub-phone-1"
+
+
+def test_stopped_provisioned_stub_is_not_leaseable(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    extra_id = extra.id
+    session = fleet.start_session(device_id=extra_id, agent_label="temp")
+    fleet.stop_session(session.id, agent_label="temp")
+    with pytest.raises((DeviceNotFoundError, FleetError)):
+        fleet.start_session(device_id=extra_id, agent_label="again")
+    ids = {item.device.id for item in fleet.list_devices()}
+    assert extra_id not in ids
+    demo = fleet.start_session(device_id="stub-demo", agent_label="demo")
+    fleet.stop_session(demo.id, agent_label="demo")
+    again = fleet.start_session(device_id="stub-demo", agent_label="demo-2")
+    assert again.device_id == "stub-demo"
+
+
+def test_cloud_does_not_route_to_stub(fleet: Fleet) -> None:
+    with pytest.raises(FleetError, match="cloud adapter"):
+        fleet.register_device(
+            device_id="farm-1",
+            provider=ProviderKind.CLOUD,
+            provider_ref="slot-1",
+        )
+    with pytest.raises(FleetError, match="does not fall back"):
+        fleet.provider_for(ProviderKind.CLOUD)
+
+
+def test_whitespace_ref_is_stripped(fleet: Fleet) -> None:
+    record = fleet.register_device(
+        device_id="padded",
+        provider=ProviderKind.STUB,
+        provider_ref="  stub-phone-8  ",
+    )
+    assert record.provider_ref == "stub-phone-8"
+
+
+def test_duplicate_ref_rejected_at_fleet(fleet: Fleet) -> None:
+    fleet.register_device(
+        device_id="one",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-7",
+    )
+    with pytest.raises(FleetError, match="already registered"):
+        fleet.register_device(
+            device_id="two",
+            provider=ProviderKind.STUB,
+            provider_ref="stub-phone-7",
+        )
+
+
+def test_concurrent_start_session_single_lease(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    winners: list[str] = []
+    errors: list[BaseException] = []
+
+    def attempt(label: str) -> None:
+        try:
+            session = fleet.start_session(device_id=extra.id, agent_label=label)
+            winners.append(session.id)
+        except (DeviceBusyError, FleetError) as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=attempt, args=(f"agent-{i}",)) for i in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(winners) == 1
+    assert errors
+    assert fleet.sessions.active_for_device(extra.id) is not None
+
+
+def test_run_after_stop_cannot_fire(fleet: Fleet) -> None:
+    session = fleet.start_session(device_id="stub-demo", agent_label="racer")
+    fleet.stop_session(session.id, agent_label="racer")
+    with pytest.raises(SessionError):
+        fleet.run(session.id, ActionRequest(name=ActionName.INFO), agent_label="racer")
+
+
+def test_run_and_stop_serialized(fleet: Fleet) -> None:
+    session = fleet.start_session(device_id="stub-demo", agent_label="lock")
+    gate = threading.Event()
+    original = fleet.stub.screenshot
+
+    def blocked_screenshot(handle: str) -> bytes:
+        gate.wait(timeout=2)
+        return original(handle)
+
+    fleet.stub.screenshot = blocked_screenshot  # type: ignore[method-assign]
+    results: list[str] = []
+
+    def runner() -> None:
+        try:
+            fleet.run(
+                session.id,
+                ActionRequest(name=ActionName.SCREENSHOT),
+                agent_label="lock",
+            )
+            results.append("ran")
+        except SessionError:
+            results.append("run-failed")
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    # Give the runner a chance to take the lease lock and enter screenshot.
+    threading.Event().wait(0.05)
+    gate.set()
+    thread.join(timeout=3)
+    stopped = fleet.stop_session(session.id, agent_label="lock")
+    assert stopped.status.value == "released"
+    assert "ran" in results or "run-failed" in results
+    if "ran" in results:
+        # Action completed under the lock before stop released the lease.
+        assert fleet.sessions.get(session.id).status.value == "released"

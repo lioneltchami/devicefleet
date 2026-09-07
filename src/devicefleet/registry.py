@@ -12,14 +12,17 @@ class DeviceNotFoundError(KeyError):
     """Raised when a registry lookup misses."""
 
 
+class DuplicateDeviceError(ValueError):
+    """Another fleet id already uses this provider + provider_ref."""
+
+
 class DeviceRegistry:
     """Register, list, and look up phones by id or tags."""
 
     def __init__(self, store: YamlStore) -> None:
         self._store = store
 
-    def _read_all(self) -> list[DeviceRecord]:
-        document = self._store.load()
+    def _parse(self, document: dict[str, object]) -> list[DeviceRecord]:
         raw_items = document.get("devices", [])
         if raw_items is None:
             return []
@@ -27,10 +30,14 @@ class DeviceRegistry:
             raise ValueError("devices.yaml must contain a list under 'devices'")
         return [DeviceRecord.model_validate(item) for item in raw_items]
 
+    def _dump(self, devices: list[DeviceRecord]) -> dict[str, object]:
+        return {"devices": [device.model_dump(mode="json") for device in devices]}
+
+    def _read_all(self) -> list[DeviceRecord]:
+        return self._parse(self._store.load())
+
     def _write_all(self, devices: list[DeviceRecord]) -> None:
-        self._store.save(
-            {"devices": [device.model_dump(mode="json") for device in devices]}
-        )
+        self._store.save(self._dump(devices))
 
     def list_devices(self) -> list[DeviceRecord]:
         """Return every registered device, oldest first."""
@@ -64,11 +71,17 @@ class DeviceRegistry:
 
     def upsert(self, device: DeviceRecord) -> DeviceRecord:
         """Insert or replace a device with the same id."""
-        devices = [item for item in self._read_all() if item.id != device.id]
-        devices.append(device)
-        devices.sort(key=lambda item: item.registered_at)
-        self._write_all(devices)
-        return device
+
+        def mutator(document: dict[str, object]) -> DeviceRecord:
+            devices = [item for item in self._parse(document) if item.id != device.id]
+            _reject_duplicate_ref(devices, device)
+            devices.append(device)
+            devices.sort(key=lambda item: item.registered_at)
+            document.clear()
+            document.update(self._dump(devices))
+            return device
+
+        return self._store.update(mutator)
 
     def register(
         self,
@@ -78,44 +91,66 @@ class DeviceRegistry:
         display_name: str | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, str] | None = None,
-        notes: str = "",
+        notes: str | None = None,
         last_status: DeviceStatus | None = None,
     ) -> DeviceRecord:
-        """Add a device. Re-registering the same id updates fields."""
-        existing: DeviceRecord | None
-        try:
-            existing = self.get(device_id)
-        except DeviceNotFoundError:
-            existing = None
-        record = DeviceRecord(
-            id=device_id,
-            display_name=display_name or device_id,
-            provider=provider,
-            provider_ref=provider_ref,
-            tags=tags or (existing.tags if existing else []),
-            metadata=metadata or (existing.metadata if existing else {}),
-            registered_at=existing.registered_at if existing else utcnow(),
-            last_seen=existing.last_seen if existing else None,
-            last_status=last_status
-            or (existing.last_status if existing else DeviceStatus.UNKNOWN),
-            notes=notes or (existing.notes if existing else ""),
-        )
-        return self.upsert(record)
+        """Add a device. Re-registering the same id updates fields.
+
+        `None` for tags/metadata/notes means "leave existing". An explicit empty
+        value (`[]`, `{}`, `""`) clears the field.
+        """
+        ref = provider_ref.strip()
+        if not ref:
+            raise ValueError("provider_ref must not be empty")
+
+        def mutator(document: dict[str, object]) -> DeviceRecord:
+            devices = self._parse(document)
+            existing = next((item for item in devices if item.id == device_id), None)
+            record = DeviceRecord(
+                id=device_id,
+                display_name=display_name or (existing.display_name if existing else device_id),
+                provider=provider,
+                provider_ref=ref,
+                tags=existing.tags if tags is None and existing else (tags or []),
+                metadata=existing.metadata
+                if metadata is None and existing
+                else (metadata or {}),
+                registered_at=existing.registered_at if existing else utcnow(),
+                last_seen=existing.last_seen if existing else None,
+                last_status=last_status
+                if last_status is not None
+                else (existing.last_status if existing else DeviceStatus.UNKNOWN),
+                notes=existing.notes if notes is None and existing else (notes or ""),
+            )
+            kept = [item for item in devices if item.id != device_id]
+            _reject_duplicate_ref(kept, record)
+            kept.append(record)
+            kept.sort(key=lambda item: item.registered_at)
+            document.clear()
+            document.update(self._dump(kept))
+            return record
+
+        return self._store.update(mutator)
 
     def remove(self, device_id: str) -> DeviceRecord:
         """Delete a device from the registry."""
-        devices = self._read_all()
-        kept: list[DeviceRecord] = []
-        removed: DeviceRecord | None = None
-        for device in devices:
-            if device.id == device_id:
-                removed = device
-            else:
-                kept.append(device)
-        if removed is None:
-            raise DeviceNotFoundError(f"device not found: {device_id}")
-        self._write_all(kept)
-        return removed
+
+        def mutator(document: dict[str, object]) -> DeviceRecord:
+            devices = self._parse(document)
+            kept: list[DeviceRecord] = []
+            removed: DeviceRecord | None = None
+            for device in devices:
+                if device.id == device_id:
+                    removed = device
+                else:
+                    kept.append(device)
+            if removed is None:
+                raise DeviceNotFoundError(f"device not found: {device_id}")
+            document.clear()
+            document.update(self._dump(kept))
+            return removed
+
+        return self._store.update(mutator)
 
     def set_status(self, device_id: str, status: DeviceStatus) -> DeviceRecord:
         """Persist last known provider availability (not occupancy)."""
@@ -144,4 +179,16 @@ class DeviceRegistry:
                 display_name="Stub Demo Phone",
                 tags=["demo", "stub", "android"],
                 notes="Virtual device from StubCloudProvider. No hardware required.",
+            )
+
+
+def _reject_duplicate_ref(others: list[DeviceRecord], candidate: DeviceRecord) -> None:
+    for item in others:
+        if (
+            item.provider is candidate.provider
+            and item.provider_ref == candidate.provider_ref
+        ):
+            raise DuplicateDeviceError(
+                f"{candidate.provider.value} handle {candidate.provider_ref} "
+                f"is already registered as {item.id}"
             )

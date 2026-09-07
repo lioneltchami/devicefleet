@@ -21,9 +21,9 @@ from devicefleet.models import (
 from devicefleet.providers.adb import LocalAdbProvider
 from devicefleet.providers.base import DeviceProvider, ProviderError
 from devicefleet.providers.stub import DEFAULT_HANDLE, StubCloudProvider
-from devicefleet.registry import DeviceNotFoundError, DeviceRegistry
-from devicefleet.sessions import SessionError, SessionManager, SessionNotFoundError
-from devicefleet.store import YamlStore
+from devicefleet.registry import DeviceNotFoundError, DeviceRegistry, DuplicateDeviceError
+from devicefleet.sessions import DeviceBusyError, SessionError, SessionManager, SessionNotFoundError
+from devicefleet.store import ExclusiveFileLock, YamlStore
 
 
 class FleetError(RuntimeError):
@@ -52,8 +52,15 @@ class Fleet:
             timeout_s=self.settings.adb_timeout_s,
         )
         self.stub = StubCloudProvider(state_path=self.settings.stub_state_path)
+        self._cloud_provider: DeviceProvider | None = None
         self.registry.ensure_stub_demo()
         self._rehydrate_stub_registry()
+
+    def set_cloud_provider(self, provider: DeviceProvider) -> None:
+        """Install a real hosted-phone adapter. Stub is never used for CLOUD."""
+        if provider is None:
+            raise ValueError("cloud provider is required")
+        self._cloud_provider = provider
 
     def provider_for(self, kind: ProviderKind) -> DeviceProvider:
         if kind is ProviderKind.ADB:
@@ -61,8 +68,12 @@ class Fleet:
         if kind is ProviderKind.STUB:
             return self.stub
         if kind is ProviderKind.CLOUD:
-            # Reserved for a future paid farm adapter registered at runtime.
-            return self.stub
+            if self._cloud_provider is None:
+                raise FleetError(
+                    "no cloud adapter is registered; ProviderKind.CLOUD "
+                    "does not fall back to StubCloudProvider"
+                )
+            return self._cloud_provider
         raise FleetError(f"unsupported provider: {kind}")
 
     def discover(self, save: bool = False) -> list[DiscoveredDevice]:
@@ -133,18 +144,26 @@ class Fleet:
         display_name: str | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, str] | None = None,
-        notes: str = "",
+        notes: str | None = None,
     ) -> DeviceRecord:
         """Add a phone to the host registry (used by CLI and HTTP)."""
-        record = self.registry.register(
-            device_id=device_id,
-            provider=provider,
-            provider_ref=provider_ref,
-            display_name=display_name,
-            tags=tags,
-            metadata=metadata,
-            notes=notes,
-        )
+        if provider is ProviderKind.CLOUD and self._cloud_provider is None:
+            raise FleetError(
+                "cannot register a CLOUD device until a cloud adapter is configured"
+            )
+        ref = provider_ref.strip()
+        try:
+            record = self.registry.register(
+                device_id=device_id,
+                provider=provider,
+                provider_ref=ref,
+                display_name=display_name,
+                tags=tags,
+                metadata=metadata,
+                notes=notes,
+            )
+        except DuplicateDeviceError as exc:
+            raise FleetError(str(exc)) from exc
         if record.provider is ProviderKind.STUB:
             self.stub.ensure(record.provider_ref, record.display_name)
         return record
@@ -167,16 +186,25 @@ class Fleet:
     ) -> SessionRecord:
         device = self._select_idle_device(device_id=device_id, tags=tags)
         label = agent_label.strip() or "anonymous"
-        session = self.sessions.start(
-            device.id,
-            agent_label=label,
-            metadata={
-                "provider": device.provider.value,
-                "provider_ref": device.provider_ref,
-            },
-        )
-        self._set_current_session(session.id, label)
-        return session
+        with self._lease_lock(device.id):
+            fresh = self.registry.get(device.id)
+            if not self._is_leaseable(fresh):
+                busy = self.sessions.active_for_device(fresh.id)
+                if busy is not None:
+                    raise DeviceBusyError(
+                        f"device {fresh.id} is held by session {busy.id} ({busy.agent_label})"
+                    )
+                raise FleetError(f"device {fresh.id} is not available to lease")
+            session = self.sessions.start(
+                fresh.id,
+                agent_label=label,
+                metadata={
+                    "provider": fresh.provider.value,
+                    "provider_ref": fresh.provider_ref,
+                },
+            )
+            self._set_current_session(session.id, label)
+            return session
 
     def attach_session(
         self, session_id: str, agent_label: str | None = None
@@ -188,18 +216,30 @@ class Fleet:
     def stop_session(
         self, session_id: str, agent_label: str | None = None
     ) -> SessionRecord:
-        if agent_label:
-            self.sessions.require_owner(session_id, agent_label)
-        session = self.sessions.stop(session_id)
-        self._clear_current_session(session.id, session.agent_label)
-        self._release_cloud_handle(session)
-        return session
+        peek = self.sessions.get(session_id)
+        with self._lease_lock(peek.device_id):
+            if agent_label:
+                self.sessions.require_owner(session_id, agent_label)
+            session = self.sessions.stop(session_id)
+            self._clear_current_session(session.id, session.agent_label)
+            self._release_cloud_handle(session)
+            return session
 
     def run(
         self,
         session_id: str,
         request: ActionRequest,
         agent_label: str | None = None,
+    ) -> ActionResult:
+        peek = self.sessions.get(session_id)
+        with self._lease_lock(peek.device_id):
+            return self._run_locked(session_id, request, agent_label)
+
+    def _run_locked(
+        self,
+        session_id: str,
+        request: ActionRequest,
+        agent_label: str | None,
     ) -> ActionResult:
         if agent_label:
             session = self.sessions.require_owner(session_id, agent_label)
@@ -331,31 +371,53 @@ class Fleet:
         if not candidates:
             hint = device_id or (",".join(tags or []) or "any")
             raise DeviceNotFoundError(f"no registered device matches {hint}")
-        idle = [
-            device
-            for device in candidates
-            if self.sessions.active_for_device(device.id) is None
-        ]
+        idle = [device for device in candidates if self._is_leaseable(device)]
         if not idle:
             raise FleetError(
-                "all matching devices have an active session; "
-                "stop one or pick a different id/tag"
+                "all matching devices are leased or unavailable; "
+                "stop a session or pick a different id/tag"
             )
         return idle[0]
 
+    def _is_leaseable(self, device: DeviceRecord) -> bool:
+        if self.sessions.active_for_device(device.id) is not None:
+            return False
+        if device.provider is ProviderKind.CLOUD and self._cloud_provider is None:
+            return False
+        if device.provider is ProviderKind.STUB and not self.stub.health(device.provider_ref):
+            return False
+        if device.last_status is DeviceStatus.OFFLINE:
+            return False
+        return True
+
+    def _lease_lock(self, device_id: str) -> ExclusiveFileLock:
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in device_id)
+        return ExclusiveFileLock(self.settings.home / "locks" / f"{safe}.lock")
+
+    def artifact_file(self, session_id: str, name: str) -> Path:
+        """Resolve a host-side artifact path; reject traversal."""
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ValueError("invalid artifact name")
+        path = (self.settings.artifacts_dir / session_id / name).resolve()
+        root = self.settings.artifacts_dir.resolve()
+        if root not in path.parents and path.parent != root:
+            raise ValueError("artifact path escapes the artifacts directory")
+        return path
+
     def _set_current_session(self, session_id: str | None, agent_label: str) -> None:
         agent = agent_label.strip() or "anonymous"
-        document = self.state_store.load()
-        mapping = document.get("current_sessions")
-        if not isinstance(mapping, dict):
-            mapping = {}
-        else:
-            mapping = dict(mapping)
-        if session_id:
-            mapping[agent] = session_id
-        else:
-            mapping.pop(agent, None)
-        self.state_store.save({"current_sessions": mapping})
+
+        def mutator(document: dict[str, object]) -> None:
+            mapping = document.get("current_sessions")
+            merged: dict[str, object] = dict(mapping) if isinstance(mapping, dict) else {}
+            if session_id:
+                merged[agent] = session_id
+            else:
+                merged.pop(agent, None)
+            document.clear()
+            document["current_sessions"] = merged
+
+        self.state_store.update(mutator)
 
     def _clear_current_session(self, session_id: str, agent_label: str) -> None:
         current = self.current_session_id(agent_label)
@@ -418,3 +480,8 @@ class Fleet:
             self.stub.release_cloud(handle)
         except ProviderError:
             pass
+        if kind == ProviderKind.STUB.value:
+            try:
+                self.registry.remove(session.device_id)
+            except DeviceNotFoundError:
+                pass

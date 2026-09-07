@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -27,6 +28,7 @@ class HttpTransport:
         token: str | None = None,
         agent_label: str = "anonymous",
         timeout_s: float = 60.0,
+        artifacts_dir: Path | None = None,
     ) -> None:
         if not base_url or not base_url.strip():
             raise ValueError("base_url is required")
@@ -34,6 +36,7 @@ class HttpTransport:
         self.token = token
         self.agent_label = agent_label.strip() or "anonymous"
         self.timeout_s = timeout_s
+        self.artifacts_dir = artifacts_dir
 
     def discover(self, save: bool = False) -> list[DiscoveredDevice]:
         data = self._request("POST", "/devices/discover", json={"save": save})
@@ -54,13 +57,14 @@ class HttpTransport:
         display_name: str | None = None,
         tags: list[str] | None = None,
     ) -> DeviceRecord:
-        payload = {
+        payload: dict[str, Any] = {
             "device_id": device_id,
             "provider": provider.value,
             "provider_ref": provider_ref,
             "display_name": display_name,
-            "tags": tags or [],
         }
+        if tags is not None:
+            payload["tags"] = tags
         data = self._request("POST", "/devices", json=payload)
         return DeviceRecord.model_validate(data)
 
@@ -111,7 +115,24 @@ class HttpTransport:
             f"/sessions/{session_id}/actions",
             json=request.model_dump(mode="json"),
         )
-        return ActionResult.model_validate(data)
+        result = ActionResult.model_validate(data)
+        if result.artifact_path and self.artifacts_dir is not None:
+            name = Path(result.artifact_path).name
+            local = self._download_artifact(session_id, name)
+            payload = dict(result.payload)
+            payload["path"] = str(local)
+            result = result.model_copy(
+                update={"artifact_path": str(local), "payload": payload}
+            )
+        return result
+
+    def _download_artifact(self, session_id: str, name: str) -> Path:
+        raw = self._request_bytes("GET", f"/sessions/{session_id}/artifacts/{name}")
+        folder = self.artifacts_dir / session_id if self.artifacts_dir else Path(session_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        path.write_bytes(raw)
+        return path
 
     def current_session_id(self) -> str | None:
         """Remote agents must pass --session; the host has no shared current."""
@@ -140,6 +161,15 @@ class HttpTransport:
             detail = _error_detail(response)
             raise RuntimeError(f"fleet host {method} {path} failed: {detail}")
         return response.json()
+
+    def _request_bytes(self, method: str, path: str) -> bytes:
+        url = f"{self.base_url}{path}"
+        with httpx.Client(timeout=self.timeout_s) as client:
+            response = client.request(method, url, headers=self._headers())
+        if response.status_code >= 400:
+            detail = _error_detail(response)
+            raise RuntimeError(f"fleet host {method} {path} failed: {detail}")
+        return response.content
 
 
 def _error_detail(response: httpx.Response) -> str:

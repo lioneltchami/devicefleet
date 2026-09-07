@@ -60,7 +60,10 @@ def _transport(ctx: typer.Context) -> LocalTransport | HttpTransport:
     token = ctx.obj.get("token") or settings.token
     if remote:
         transport: LocalTransport | HttpTransport = HttpTransport(
-            remote, token=token, agent_label=agent
+            remote,
+            token=token,
+            agent_label=agent,
+            artifacts_dir=settings.artifacts_dir,
         )
     else:
         transport = LocalTransport(_fleet(ctx), agent_label=agent)
@@ -127,6 +130,12 @@ def doctor(
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Check Python, data dir, adb, and registered devices."""
+    settings: Settings = ctx.obj["settings"]
+    if ctx.obj.get("remote_url") or settings.remote_url:
+        raise typer.BadParameter(
+            "doctor inspects the local machine; --remote is not supported. "
+            "Run `devicefleet doctor` on the fleet host instead."
+        )
     report = run_doctor(_fleet(ctx))
     if as_json:
         console.print_json(report.model_dump_json())
@@ -244,13 +253,16 @@ def devices_register(
         kind = ProviderKind(provider)
     except ValueError as exc:
         raise typer.BadParameter("provider must be adb, stub, or cloud") from exc
-    record = _transport(ctx).register_device(
-        device_id=device_id,
-        provider=kind,
-        provider_ref=ref,
-        display_name=name,
-        tags=tag or [],
-    )
+    try:
+        record = _transport(ctx).register_device(
+            device_id=device_id,
+            provider=kind,
+            provider_ref=ref.strip(),
+            display_name=name,
+            tags=tag,
+        )
+    except (FleetError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print(f"registered {record.id} ({record.provider.value}:{record.provider_ref})")
 
 

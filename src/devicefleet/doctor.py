@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import shutil
 import sys
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 from devicefleet import __version__
@@ -40,12 +42,12 @@ def run_doctor(fleet: Fleet) -> DoctorReport:
     )
 
     home = fleet.settings.home
-    writable = home.exists() and home.is_dir()
+    writable = _dir_is_writable(home)
     checks.append(
         Check(
             name="data_dir",
             ok=writable,
-            detail=str(home),
+            detail=str(home) if writable else f"{home} is not writable",
         )
     )
 
@@ -107,3 +109,16 @@ def run_doctor(fleet: Fleet) -> DoctorReport:
         devices=devices,
         adb_serials=adb_serials,
     )
+
+
+def _dir_is_writable(path: Path) -> bool:
+    """True only if we can create and remove a probe file in `path`."""
+    if not path.exists() or not path.is_dir():
+        return False
+    probe = path / ".devicefleet-write-probe"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError:
+        return False
+    return True

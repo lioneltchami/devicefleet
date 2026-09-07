@@ -28,7 +28,7 @@ Registry Sessions   Providers
 | --- | --- |
 | `devicefleet.config` | `DEVICEFLEET_*` settings and the data directory |
 | `devicefleet.models` | Pydantic records shared by CLI, API, and tests |
-| `devicefleet.store` | Atomic YAML read/write |
+| `devicefleet.store` | Atomic YAML read/write (unique temp per save + exclusive file lock) |
 | `devicefleet.registry` | Multi-device catalog (id, tags, provider ref) |
 | `devicefleet.sessions` | Exclusive create / attach / release |
 | `devicefleet.providers.base` | `DeviceProvider` ABC + `CloudDeviceProvider` protocol |
@@ -46,7 +46,8 @@ State lives under `$DEVICEFLEET_HOME` (default `~/.devicefleet`):
 - `sessions.yaml` — leases
 - `state.yaml` — per-agent current session ids for the local CLI
 - `stub-state.yaml` — virtual phone state so CLI commands share one stub
-- `artifacts/<session>/` — screenshots and UI dumps
+- `artifacts/<session>/` — screenshots and UI dumps (remote clients download into their own home)
+- `locks/` — per-device lease locks so start/stop/run cannot interleave unsafely
 
 ## Why sessions are first-class
 
@@ -75,14 +76,18 @@ Cloud backends additionally implement `CloudDeviceProvider`:
 
 1. Create `devicefleet/providers/browserstack.py` (or similar) that subclasses `DeviceProvider` and satisfies `CloudDeviceProvider`.
 2. Translate the farm’s session token into `DeviceRecord.provider_ref`.
-3. Register it in `Fleet.provider_for` under `ProviderKind.CLOUD` (or a new enum value).
+3. Call `Fleet.set_cloud_provider(...)` (or register it in `Fleet.provider_for`) under `ProviderKind.CLOUD`.
 4. Keep secrets in the environment (`BROWSERSTACK_USERNAME`, …), not in YAML.
+
+`ProviderKind.CLOUD` does **not** fall back to `StubCloudProvider`. Registering or leasing a CLOUD device before an adapter is installed is an error.
 
 Do not special-case the CLI or the HTTP routes. New farms should be invisible above the provider layer.
 
 ## Transport
 
-`LocalTransport` calls `Fleet` in-process. `HttpTransport` calls the same operations on `devicefleet serve`. The CLI chooses HTTP when `--remote` or `DEVICEFLEET_REMOTE_URL` is set. That is how a laptop agent drives a lab machine that actually has the USB hub.
+`LocalTransport` calls `Fleet` in-process. `HttpTransport` calls the same operations on `devicefleet serve`. After a remote screenshot or UI dump, the client fetches `GET /sessions/{id}/artifacts/{name}` into local `$DEVICEFLEET_HOME/artifacts`. The CLI chooses HTTP when `--remote` or `DEVICEFLEET_REMOTE_URL` is set. That is how a laptop agent drives a lab machine that actually has the USB hub.
+
+`YamlStore.save` writes a unique temp file then `os.replace`s it. Concurrent `save()` calls are last-writer-wins for the whole document. `YamlStore.update` holds an exclusive lock for a read-modify-write so session start and current-session maps merge safely. Current-session keys are last-writer-wins per agent.
 
 ## Future work (not in v0)
 
@@ -90,7 +95,7 @@ Do not special-case the CLI or the HTTP routes. New farms should be invisible ab
 - Production BrowserStack / Device Farm adapters
 - Richer authn than a shared `DEVICEFLEET_TOKEN` (v0 uses bearer / `X-Devicefleet-Token` plus agent ownership)
 - Rich IME / unicode input beyond `adb shell input text`
-- Cross-process file locks if many local processes share one `DEVICEFLEET_HOME`
+- Richer distributed locking if many hosts share one `DEVICEFLEET_HOME` over NFS
 
 ## Design rules
 

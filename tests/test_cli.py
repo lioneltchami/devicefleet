@@ -90,3 +90,40 @@ def test_skill_mentions_sessions() -> None:
     assert "session start" in result.stdout
     assert "DEVICEFLEET_CURRENT_SESSION" in result.stdout
     assert "DEVICEFLEET_SESSION" not in result.stdout.replace("DEVICEFLEET_CURRENT_SESSION", "")
+    assert "downloads those files" in result.stdout
+
+
+def test_remote_doctor_is_rejected(tmp_path: Path) -> None:
+    home = str(tmp_path / "home")
+    result = runner.invoke(
+        app,
+        ["--home", home, "--remote", "http://127.0.0.1:8765", "doctor"],
+    )
+    assert result.exit_code != 0
+    output = (result.stdout or "") + (result.stderr or "") + (result.output or "")
+    assert "not supported" in output or "fleet host" in output
+
+
+def test_register_strips_ref_whitespace(tmp_path: Path) -> None:
+    home = str(tmp_path / "home")
+    registered = runner.invoke(
+        app,
+        [
+            "--home",
+            home,
+            "devices",
+            "register",
+            "lab-pad",
+            "--provider",
+            "stub",
+            "--ref",
+            "  stub-phone-5  ",
+            "--name",
+            "Padded",
+        ],
+    )
+    assert registered.exit_code == 0, registered.stdout
+    listed = runner.invoke(app, ["--home", home, "devices", "list", "--json"])
+    assert listed.exit_code == 0
+    assert "stub-phone-5" in listed.stdout
+    assert "  stub-phone-5  " not in listed.stdout

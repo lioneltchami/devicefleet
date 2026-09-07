@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,8 +52,12 @@ class LocalAdbProvider(DeviceProvider):
         self.timeout_s = timeout_s
 
     def available(self) -> bool:
-        """True when the adb executable is on PATH or at the configured path."""
-        return shutil.which(self.adb_bin) is not None or Path(self.adb_bin).is_file()
+        """True when `adb_bin` resolves to an executable file."""
+        which = shutil.which(self.adb_bin)
+        if which:
+            return True
+        path = Path(self.adb_bin)
+        return path.is_file() and os.access(path, os.X_OK)
 
     def discover(self) -> list[DiscoveredDevice]:
         if not self.available():
@@ -108,10 +113,11 @@ class LocalAdbProvider(DeviceProvider):
     def type_text(self, handle: str, text: str) -> None:
         if text is None:
             raise ValueError("text is required")
-        escaped = _adb_input_escape(text)
-        if not escaped:
-            return
-        self._checked(["shell", "input", "text", escaped], handle)
+        for kind, value in type_segments(text):
+            if kind == "key":
+                self.keyevent(handle, value)
+            elif value:
+                self._checked(["shell", "input", "text", value], handle)
 
     def keyevent(self, handle: str, key: str) -> None:
         if not key or not str(key).strip():
@@ -178,6 +184,12 @@ class LocalAdbProvider(DeviceProvider):
             raise ProviderUnavailableError(
                 f"adb not found ({self.adb_bin}). Install Android platform-tools."
             ) from exc
+        except PermissionError as exc:
+            raise ProviderError(
+                f"cannot execute adb ({self.adb_bin}): permission denied"
+            ) from exc
+        except OSError as exc:
+            raise ProviderError(f"cannot execute adb ({self.adb_bin}): {exc}") from exc
         except subprocess.TimeoutExpired as exc:
             raise ProviderError(f"adb timed out: {' '.join(command)}") from exc
 
@@ -257,22 +269,43 @@ def _resolve_key(key: str) -> str:
     return token.upper()
 
 
-def _adb_input_escape(text: str) -> str:
-    """Escape a string for `adb shell input text`.
+# Device `adb shell` may pass this through sh. Encode anything that is not
+# a safe token character. `%` is encoded first so a literal `%s` is not a space.
+_SHELL_META = frozenset("`&|<>()$?!\"'\\;#$[]{}*~")
 
-    The input text helper is ASCII-oriented: spaces become %s and a small set
-    of shell metacharacters is percent-encoded. Rich IME input is out of scope.
+
+def _adb_input_escape(text: str) -> str:
+    """Escape a string for `adb shell input text` without shell substitution.
+
+    Spaces become `%s` (adb's space token). `%` becomes `%25` so user text
+    containing `%s` is not rewritten as a space. Backticks and other
+    metacharacters are percent-encoded. Newlines are not encoded here —
+    `type_text` sends ENTER keyevents instead.
     """
+    if "\n" in text or "\r" in text:
+        raise ValueError("newlines must be sent as ENTER keyevents")
     pieces: list[str] = []
     for char in text:
-        if char == " ":
+        if char == "%":
+            pieces.append("%25")
+        elif char == " ":
             pieces.append("%s")
-        elif char == "\n":
-            pieces.append("%n")
-        elif char in r'&|<>()$?!"\'\\;':
-            pieces.append(f"%{ord(char):02x}")
-        elif ord(char) < 32 or ord(char) > 126:
+        elif char in _SHELL_META or ord(char) < 32 or ord(char) > 126:
             pieces.append(f"%{ord(char):02x}")
         else:
             pieces.append(char)
     return "".join(pieces)
+
+
+def type_segments(text: str) -> list[tuple[str, str]]:
+    """Split typed text into `input text` chunks and ENTER keyevents."""
+    lines = text.split("\n")
+    segments: list[tuple[str, str]] = []
+    for index, line in enumerate(lines):
+        line = line.replace("\r", "")
+        escaped = _adb_input_escape(line)
+        if escaped:
+            segments.append(("text", escaped))
+        if index < len(lines) - 1:
+            segments.append(("key", "ENTER"))
+    return segments

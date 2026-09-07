@@ -88,7 +88,11 @@ class SessionManager:
         metadata: dict[str, str] | None = None,
     ) -> SessionRecord:
         """Create a new exclusive session. Check-and-save is atomic under the store lock."""
-        if not device_id.strip():
+        # Normalize device_id so different spacings (e.g. "phone-1" vs
+        # " phone-1 ") do not create two concurrent active leases on the
+        # same physical device.
+        device_id = device_id.strip()
+        if not device_id:
             raise ValueError("device_id is required")
 
         def mutator(document: dict[str, object]) -> SessionRecord:
@@ -172,12 +176,21 @@ class SessionManager:
             )
         return session
 
-    def stop(self, session_id: str, when: datetime | None = None) -> StopResult:
+    def stop(
+        self,
+        session_id: str,
+        when: datetime | None = None,
+        release_pending: bool = True,
+    ) -> StopResult:
         """Release a session so another agent can take the device.
 
         Returns the session and a `transitioned` flag; the flag is False on an
         idempotent re-stop so callers do not release resources they did not
         actually acquire this call.
+
+        `release_pending` is set in the same atomic mutator as the RELEASED
+        transition, so a follow-up failure on the cloud release can never
+        leave a "RELEASED + no marker" state that would skip the next retry.
         """
 
         def mutator(document: dict[str, object]) -> tuple[SessionRecord, bool]:
@@ -191,10 +204,16 @@ class SessionManager:
                 raise SessionNotFoundError(f"session not found: {session_id}")
             if found.status == SessionStatus.RELEASED:
                 return found, False
+            metadata = dict(found.metadata)
+            if release_pending:
+                metadata["release_pending"] = "true"
+            else:
+                metadata.pop("release_pending", None)
             updated = found.model_copy(
                 update={
                     "status": SessionStatus.RELEASED,
                     "released_at": when or utcnow(),
+                    "metadata": metadata,
                 }
             )
             replaced = [item for item in sessions if item.id != session_id]

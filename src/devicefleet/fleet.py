@@ -66,23 +66,29 @@ class Fleet:
         # a non-releasing provider can pass a no-op method.
         if not callable(getattr(provider, "release_cloud", None)):
             raise ValueError("cloud provider must implement release_cloud")
-        # Replacing the adapter while a CLOUD session is active would route
-        # `release_cloud` to the wrong adapter on stop (the original
-        # adapter leaks, the new one gets a release for a handle it does
-        # not own). Refuse the replacement; callers must stop active
-        # CLOUD sessions first.
-        if self._cloud_provider is not None:
-            for session in self.sessions.list_sessions(active_only=True):
-                try:
-                    device = self.registry.get(session.device_id)
-                except DeviceNotFoundError:
-                    continue
-                if device.provider is ProviderKind.CLOUD:
-                    raise ValueError(
-                        f"cannot replace cloud provider while CLOUD session "
-                        f"{session.id} on {session.device_id} is active; "
-                        "stop the session first"
-                    )
+        # Guard against the new adapter receiving `release_cloud` for a
+        # handle owned by the previous (or initial) adapter. This covers
+        # (a) the first installation when persisted CLOUD sessions exist,
+        # (b) active CLOUD sessions on replacement, and (c) RELEASED
+        # sessions with a pending release that the next stop_session call
+        # will retry. The session stores the captured provider kind, so
+        # we use that instead of re-resolving through the (possibly
+        # changed) registry record.
+        for session in self.sessions.list_sessions(active_only=False):
+            if session.metadata.get("provider") != ProviderKind.CLOUD.value:
+                continue
+            if (
+                session.status is not SessionStatus.ACTIVE
+                and session.metadata.get("release_pending") != "true"
+            ):
+                continue
+            raise ValueError(
+                f"cannot install cloud provider while CLOUD session "
+                f"{session.id} on {session.device_id} still holds a handle "
+                f"(status={session.status.value}, "
+                f"release_pending={session.metadata.get('release_pending', 'false')}); "
+                "stop the session and clear any pending release first"
+            )
         self._cloud_provider = provider
 
     def provider_for(self, kind: ProviderKind) -> DeviceProvider:
@@ -391,18 +397,17 @@ class Fleet:
                 self._retry_pending_release(current)
                 self._clear_current_session(current.id, current.agent_label)
                 return current
-            # Mark RELEASED first so the persistent state is the source of
-            # truth. If the cloud release then fails, the session is already
-            # RELEASED; a subsequent stop_session retry will see the
-            # `release_pending` marker and try again.
-            result = self.sessions.stop(session_id)
+            # Mark RELEASED + release_pending atomically. The marker is set
+            # in the same mutator as the status change, so a disk failure on
+            # the marker write can never leave a "RELEASED + no marker"
+            # state that would skip cloud cleanup on retry.
+            result = self.sessions.stop(session_id, release_pending=True)
             try:
                 self._release_cloud_handle(result.session)
             except Exception:
-                # The session is RELEASED but the handle is still held.
-                # Mark the session so the next stop_session retry can pick
-                # the release back up, then surface the failure.
-                self.sessions.set_release_pending(session_id, pending=True)
+                # The session is RELEASED and the release_pending marker is
+                # durably set. The next stop_session retry will see the
+                # marker and try the release again.
                 self._clear_current_session(
                     result.session.id, result.session.agent_label
                 )
@@ -723,7 +728,13 @@ class Fleet:
         kind = (session.metadata.get("provider") or "").strip()
         if kind not in {ProviderKind.STUB.value, ProviderKind.CLOUD.value}:
             return
-        if not handle or handle == DEFAULT_HANDLE:
+        if not handle:
+            return
+        # `DEFAULT_HANDLE` is the reserved STUB identifier. A CLOUD provider
+        # may legitimately allocate a handle that happens to equal
+        # `stub-phone-1`; skipping those releases would leak the hosted
+        # allocation. Restrict the exemption to STUB.
+        if kind == ProviderKind.STUB.value and handle == DEFAULT_HANDLE:
             return
         if kind == ProviderKind.STUB.value and not _is_provisioned(session):
             return

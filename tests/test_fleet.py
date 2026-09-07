@@ -986,6 +986,84 @@ def test_stop_session_abandons_pending_release_when_new_lease_exists(
     fleet.stop_session(second.id, session_secret=second.secret)
 
 
+def test_session_start_normalizes_device_id(fleet: Fleet) -> None:
+    """`SessionManager.start` must strip device_id so differently-spaced forms
+    cannot both create active leases on the same device.
+    """
+    fleet.register_device(
+        device_id="phone-1",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-idnorm",
+        display_name="Phone 1",
+    )
+    first = fleet.start_session(device_id="phone-1", agent_label="alice")
+    assert first.device_id == "phone-1"
+    # The second start uses a padded form; the underlying session must
+    # collide on the stripped id and raise DeviceBusyError.
+    with pytest.raises(DeviceBusyError):
+        fleet.start_session(device_id="  phone-1  ", agent_label="bob")
+    fleet.stop_session(first.id, session_secret=first.secret)
+
+
+def test_set_cloud_provider_rejects_when_pending_release_exists(fleet: Fleet) -> None:
+    """set_cloud_provider must refuse installation when a persisted session has
+    a CLOUD handle with a pending release — otherwise the new adapter would
+    receive `release_cloud` for a handle owned by the previous adapter.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("slot-p", "Slot P")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    session = fleet.start_session(device_id="slot-p", agent_label="farm")
+    # First stop fails -> release_pending set
+    cloud.fail_release = True
+    with pytest.raises(ProviderError):
+        fleet.stop_session(session.id, session_secret=session.secret)
+    # Now replacing the adapter must fail because the old handle is still
+    # held with a pending release.
+    new_cloud = FakeCloudProvider()
+    with pytest.raises(ValueError, match="pending release"):
+        fleet.set_cloud_provider(new_cloud)
+    # Clear the pending release (by retrying) and the replacement is allowed
+    cloud.fail_release = False
+    fleet.stop_session(session.id, session_secret=session.secret)
+    fleet.set_cloud_provider(new_cloud)
+
+
+def test_release_cloud_handle_runs_for_cloud_with_default_handle(fleet: Fleet) -> None:
+    """The DEFAULT_HANDLE exemption must apply only to STUB; a CLOUD provider
+    may legitimately allocate `stub-phone-1` and we must release it.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("stub-phone-1", "Cloud on default name")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    session = fleet.start_session(device_id="stub-phone-1", agent_label="farm")
+    fleet.stop_session(session.id, session_secret=session.secret)
+    assert "stub-phone-1" in cloud.released
+
+
+def test_release_pending_marker_set_atomically_with_stop(fleet: Fleet) -> None:
+    """Even when the cloud release is bypassed or fails before the marker is
+    written separately, the marker must already be on the persisted session
+    record so the next stop_session retry can find it. SessionManager.stop
+    now writes the marker inside the same mutator as the RELEASED transition.
+    """
+    from devicefleet.sessions import SessionManager
+
+    sm = SessionManager(fleet.sessions._store)
+    # Seed an active session directly through the manager
+    record = sm.start("atomic-phone", agent_label="alice")
+    assert record.metadata.get("release_pending") != "true"
+    # Now stop it; the marker must be set on the returned record.
+    result = sm.stop(record.id)
+    assert result.transitioned is True
+    assert result.session.metadata.get("release_pending") == "true"
+    # And it must persist across a re-read
+    reloaded = sm.get(record.id)
+    assert reloaded.metadata.get("release_pending") == "true"
+
+
 def test_clear_current_session_does_not_evict_concurrent_start(fleet: Fleet) -> None:
     """A concurrent start on a *different* device that writes a new id for the
     same agent must not be wiped by a stale _clear_current_session that was

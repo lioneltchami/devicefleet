@@ -21,6 +21,10 @@ class DeviceBusyError(SessionError):
     """Another active session already holds this device."""
 
 
+class SessionOwnershipError(SessionError):
+    """Caller is not the agent that holds this lease."""
+
+
 class SessionManager:
     """Create, attach, list, and release device sessions."""
 
@@ -88,13 +92,31 @@ class SessionManager:
         return session
 
     def attach(self, session_id: str, agent_label: str | None = None) -> SessionRecord:
-        """Rejoin an existing active session (same or takeover-friendly agent)."""
+        """Rejoin an existing active session. The agent label must match the owner."""
         session = self.get(session_id)
         if session.status != SessionStatus.ACTIVE:
             raise SessionError(f"session {session_id} is not active")
-        if agent_label and agent_label.strip() and agent_label != session.agent_label:
-            updated = session.model_copy(update={"agent_label": agent_label.strip()})
-            return self._replace(updated)
+        caller = (agent_label or "").strip()
+        if not caller:
+            raise SessionOwnershipError(
+                "agent_label is required to attach; a session id alone is not enough"
+            )
+        if caller != session.agent_label:
+            raise SessionOwnershipError(
+                f"session {session_id} belongs to {session.agent_label}, not {caller}"
+            )
+        return session
+
+    def require_owner(self, session_id: str, agent_label: str | None) -> SessionRecord:
+        """Return the session only if it is active and owned by this agent."""
+        session = self.get(session_id)
+        if session.status != SessionStatus.ACTIVE:
+            raise SessionError(f"session {session_id} is not active")
+        caller = (agent_label or "").strip()
+        if not caller or caller != session.agent_label:
+            raise SessionOwnershipError(
+                f"session {session_id} is not owned by {caller or 'unknown agent'}"
+            )
         return session
 
     def stop(self, session_id: str, when: datetime | None = None) -> SessionRecord:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from devicefleet.models import CloudDeviceSpec
 from devicefleet.providers.base import CloudDeviceProvider
-from devicefleet.providers.stub import StubCloudProvider
+from devicefleet.providers.stub import MAX_ACTIONS, MAX_TEXT, StubCloudProvider
 
 
 def test_stub_satisfies_cloud_protocol() -> None:
@@ -39,6 +39,18 @@ def test_state_survives_reload(tmp_path) -> None:
     assert second.describe("stub-phone-1")["last_tap"] == "111,222"
     xml = second.dump_ui("stub-phone-1")
     assert "[111,222]" in xml
+
+
+def test_action_log_and_text_are_capped() -> None:
+    provider = StubCloudProvider()
+    handle = "stub-phone-1"
+    for index in range(MAX_ACTIONS + 50):
+        provider.tap(handle, 1, 1)
+    assert len(provider.action_log(handle)) == MAX_ACTIONS
+    provider.type_text(handle, "x" * (MAX_TEXT + 80))
+    assert len(provider.describe(handle)["last_tap"]) > 0
+    phone = provider._require(handle)
+    assert len(phone.last_text) == MAX_TEXT
 
 
 def test_provision_and_release() -> None:

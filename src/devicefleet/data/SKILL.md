@@ -38,13 +38,13 @@ Useful selectors:
 ```bash
 devicefleet session start --device pixel-lab
 devicefleet session start --tag lab --tag android --agent coder
-devicefleet session attach ses_ab12cd34ef56
+devicefleet session attach ses_ab12cd34ef56 --agent coder
 devicefleet session list --active
 ```
 
 `--tag` is AND. If every matching device is busy, start fails — pick another tag or wait. Do not “just run adb” on a device that already has a session.
 
-The CLI remembers the current session. Helper commands omit `--session` when you started it in this data dir. On a remote host, pass `--session` explicitly or use `DEVICEFLEET_SESSION`.
+Locally, the CLI remembers **your** current session, keyed by `--agent` / `DEVICEFLEET_AGENT`. Another agent in the same data dir will not pick it up. `DEVICEFLEET_CURRENT_SESSION` overrides that memory for this process only. On `--remote`, always pass `--session` (there is no shared current session). Attach requires the same agent label that started the lease.
 
 ## Helpers
 
@@ -74,15 +74,17 @@ devicefleet devices register pixel-2 --provider adb --ref EMULATOR-5554 --tag em
 If the phones are attached to another machine:
 
 ```bash
-# on the lab host
+# on the lab host (0.0.0.0 requires DEVICEFLEET_TOKEN)
+export DEVICEFLEET_TOKEN=replace-me
 devicefleet serve --host 0.0.0.0 --port 8765
 
 # on the agent machine
-devicefleet --remote http://lab:8765 session start --tag android
-devicefleet --remote http://lab:8765 run screenshot
+export DEVICEFLEET_TOKEN=replace-me
+devicefleet --remote http://lab:8765 --agent coder session start --tag android
+devicefleet --remote http://lab:8765 --agent coder run screenshot --session ses_…
 ```
 
-`DEVICEFLEET_REMOTE_URL` sets the default remote.
+`DEVICEFLEET_REMOTE_URL` sets the default remote. Send the token with `--token` or `DEVICEFLEET_TOKEN`.
 
 ## Cloud providers
 

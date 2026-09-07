@@ -57,6 +57,7 @@ class DeviceRecord(BaseModel):
     metadata: dict[str, str] = Field(default_factory=dict)
     registered_at: datetime = Field(default_factory=utcnow)
     last_seen: datetime | None = None
+    last_status: DeviceStatus = DeviceStatus.UNKNOWN
     notes: str = ""
 
     @field_validator("id")

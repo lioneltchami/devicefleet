@@ -50,6 +50,43 @@ def test_doctor_and_stub_flow(tmp_path: Path) -> None:
     assert stopped.exit_code == 0, stopped.stdout
 
 
+def test_devices_rm_refuses_active_session(tmp_path: Path) -> None:
+    home = str(tmp_path / "home")
+    started = runner.invoke(
+        app, ["--home", home, "session", "start", "--device", "stub-demo"]
+    )
+    assert started.exit_code == 0, started.stdout
+    removed = runner.invoke(app, ["--home", home, "devices", "rm", "stub-demo"])
+    assert removed.exit_code != 0
+    assert "held by session" in removed.output or "held by session" in (removed.stderr or "")
+
+
+def test_devices_register_updates_registry(tmp_path: Path) -> None:
+    home = str(tmp_path / "home")
+    registered = runner.invoke(
+        app,
+        [
+            "--home",
+            home,
+            "devices",
+            "register",
+            "lab-1",
+            "--provider",
+            "stub",
+            "--ref",
+            "stub-phone-4",
+            "--name",
+            "Lab",
+        ],
+    )
+    assert registered.exit_code == 0, registered.stdout
+    listed = runner.invoke(app, ["--home", home, "devices", "list", "--json"])
+    assert listed.exit_code == 0
+    assert "lab-1" in listed.stdout
+
+
 def test_skill_mentions_sessions() -> None:
     result = runner.invoke(app, ["skill"])
     assert "session start" in result.stdout
+    assert "DEVICEFLEET_CURRENT_SESSION" in result.stdout
+    assert "DEVICEFLEET_SESSION" not in result.stdout.replace("DEVICEFLEET_CURRENT_SESSION", "")

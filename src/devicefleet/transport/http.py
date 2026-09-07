@@ -6,11 +6,14 @@ from typing import Any
 
 import httpx
 
+from devicefleet.auth import AGENT_HEADER, TOKEN_HEADER
 from devicefleet.models import (
     ActionRequest,
     ActionResult,
     DeviceListItem,
+    DeviceRecord,
     DiscoveredDevice,
+    ProviderKind,
     SessionRecord,
 )
 
@@ -18,10 +21,18 @@ from devicefleet.models import (
 class HttpTransport:
     """Call the FastAPI fleet host. Same operations as LocalTransport."""
 
-    def __init__(self, base_url: str, timeout_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str | None = None,
+        agent_label: str = "anonymous",
+        timeout_s: float = 60.0,
+    ) -> None:
         if not base_url or not base_url.strip():
             raise ValueError("base_url is required")
         self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.agent_label = agent_label.strip() or "anonymous"
         self.timeout_s = timeout_s
 
     def discover(self, save: bool = False) -> list[DiscoveredDevice]:
@@ -34,6 +45,28 @@ class HttpTransport:
             params["tags"] = ",".join(tags)
         data = self._request("GET", "/devices", params=params)
         return [DeviceListItem.model_validate(item) for item in data]
+
+    def register_device(
+        self,
+        device_id: str,
+        provider: ProviderKind,
+        provider_ref: str,
+        display_name: str | None = None,
+        tags: list[str] | None = None,
+    ) -> DeviceRecord:
+        payload = {
+            "device_id": device_id,
+            "provider": provider.value,
+            "provider_ref": provider_ref,
+            "display_name": display_name,
+            "tags": tags or [],
+        }
+        data = self._request("POST", "/devices", json=payload)
+        return DeviceRecord.model_validate(data)
+
+    def remove_device(self, device_id: str) -> DeviceRecord:
+        data = self._request("DELETE", f"/devices/{device_id}")
+        return DeviceRecord.model_validate(data)
 
     def start_session(
         self,
@@ -52,10 +85,11 @@ class HttpTransport:
     def attach_session(
         self, session_id: str, agent_label: str | None = None
     ) -> SessionRecord:
+        label = agent_label or self.agent_label
         data = self._request(
             "POST",
             f"/sessions/{session_id}/attach",
-            json={"agent_label": agent_label},
+            json={"agent_label": label},
         )
         return SessionRecord.model_validate(data)
 
@@ -80,11 +114,15 @@ class HttpTransport:
         return ActionResult.model_validate(data)
 
     def current_session_id(self) -> str | None:
-        data = self._request("GET", "/sessions/current")
-        if not isinstance(data, dict):
-            return None
-        value = data.get("session_id")
-        return value if isinstance(value, str) else None
+        """Remote agents must pass --session; the host has no shared current."""
+        return None
+
+    def _headers(self) -> dict[str, str]:
+        headers = {AGENT_HEADER: self.agent_label}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+            headers[TOKEN_HEADER] = self.token
+        return headers
 
     def _request(
         self,
@@ -95,7 +133,9 @@ class HttpTransport:
     ) -> Any:
         url = f"{self.base_url}{path}"
         with httpx.Client(timeout=self.timeout_s) as client:
-            response = client.request(method, url, json=json, params=params)
+            response = client.request(
+                method, url, json=json, params=params, headers=self._headers()
+            )
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise RuntimeError(f"fleet host {method} {path} failed: {detail}")

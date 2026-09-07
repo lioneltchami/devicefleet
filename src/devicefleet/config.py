@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     adb_timeout_s: float = 30.0
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
+    token: str | None = None
+    agent: str = "anonymous"
     current_session: str | None = None
 
     @property

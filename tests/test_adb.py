@@ -15,9 +15,16 @@ ABCD                   unauthorized usb:1-2
     pixel = devices[0]
     assert pixel.provider_ref == "R58M30ABC"
     assert pixel.display_name == "Pixel 7"
+    assert pixel.suggested_id == "pixel-7-R58M30ABC"
     assert pixel.status.value == "online"
+    assert devices[1].suggested_id == "sdk-gphone64-arm64-emulator-5554"
     assert devices[1].suggested_tags[-1] == "emulator" or "emulator" in devices[1].suggested_tags
     assert devices[2].status.value == "offline"
+    other = _parse_adb_devices(
+        "List of devices attached\nR58OTHER device model:Pixel_7\n"
+    )
+    assert other[0].suggested_id == "pixel-7-R58OTHER"
+    assert other[0].suggested_id != pixel.suggested_id
 
 
 def test_input_escape_and_keys() -> None:

@@ -68,7 +68,7 @@ A **session** is an exclusive lease on one registered device.
 
 Two agents can run at once as long as they hold **different** devices. That is the whole point of the session model: no colliding taps on the same screen.
 
-The CLI remembers the current session under `$DEVICEFLEET_HOME` (default `~/.devicefleet`). Override the data dir with `--home` or `DEVICEFLEET_HOME`.
+Locally, the CLI remembers **this agent's** current session under `$DEVICEFLEET_HOME` (default `~/.devicefleet`), keyed by `--agent` / `DEVICEFLEET_AGENT`. Agent A cannot silently drive agent B's device. `DEVICEFLEET_CURRENT_SESSION` overrides the remembered id for the current process only. On a remote host, always pass `--session`.
 
 ## Registry
 
@@ -103,16 +103,25 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the module map and extension points.
 
 ## HTTP host
 
-Remote agents should not each spawn their own ADB daemon against the same USB bus. Run one fleet host and point clients at it:
+Remote agents should not each spawn their own ADB daemon against the same USB bus. Run one fleet host and point clients at it.
+
+`devicefleet serve` binds **127.0.0.1** by default. Binding `0.0.0.0` (or any non-loopback address) requires an explicit `--host` **and** `DEVICEFLEET_TOKEN`. Clients send the same secret as `Authorization: Bearer …` or `X-Devicefleet-Token`. Attach/stop/action also require a matching `X-Devicefleet-Agent` so a listed session id cannot steal another agent's lease.
 
 ```bash
+# local lab (loopback, token optional)
+devicefleet serve --port 8765
+
+# reachable on the network (token required)
+export DEVICEFLEET_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(24))')
 devicefleet serve --host 0.0.0.0 --port 8765
-# elsewhere:
-devicefleet --remote http://lab:8765 session start --tag android
-devicefleet --remote http://lab:8765 run screenshot
+
+# elsewhere
+export DEVICEFLEET_TOKEN=...   # same secret
+devicefleet --remote http://lab:8765 --agent coder session start --tag android
+devicefleet --remote http://lab:8765 --agent coder run screenshot --session ses_…
 ```
 
-Useful routes: `GET /health`, `GET /devices`, `POST /sessions`, `POST /sessions/{id}/actions`, `DELETE /sessions/{id}`. Open `/docs` for the generated OpenAPI UI.
+Useful routes: `GET /health` (open), `GET /devices`, `POST /devices`, `DELETE /devices/{id}`, `POST /sessions`, `POST /sessions/{id}/actions`, `DELETE /sessions/{id}`. Open `/docs` for the generated OpenAPI UI.
 
 ## Agent skill
 
@@ -128,8 +137,11 @@ Prints [SKILL.md](SKILL.md). Drop that file into an agent skill slot, or tell th
 | --- | --- |
 | `DEVICEFLEET_HOME` | Data directory (registry, sessions, screenshots) |
 | `DEVICEFLEET_REMOTE_URL` | Default fleet host for the CLI |
+| `DEVICEFLEET_TOKEN` | Shared secret for the HTTP host and `--remote` clients |
+| `DEVICEFLEET_AGENT` | Agent label used for session ownership and the local current-session map |
+| `DEVICEFLEET_CURRENT_SESSION` | Process-local session id override (does not change other agents) |
 | `DEVICEFLEET_ADB_BIN` | `adb` executable (default `adb`) |
-| `DEVICEFLEET_HOST` / `DEVICEFLEET_PORT` | Bind address for `serve` |
+| `DEVICEFLEET_HOST` / `DEVICEFLEET_PORT` | Bind address for `serve` (default `127.0.0.1:8765`) |
 
 ## Development
 

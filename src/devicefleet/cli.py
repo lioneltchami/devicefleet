@@ -11,10 +11,13 @@ from rich.console import Console
 from rich.table import Table
 
 from devicefleet import __version__
+from devicefleet.auth import validate_serve_bind
 from devicefleet.config import Settings, load_settings
 from devicefleet.doctor import run_doctor
-from devicefleet.fleet import Fleet
-from devicefleet.models import ActionName, ActionRequest, DeviceListItem, SessionRecord
+from devicefleet.fleet import DeviceInUseError, Fleet, FleetError
+from devicefleet.models import ActionName, ActionRequest, DeviceListItem, ProviderKind, SessionRecord
+from devicefleet.registry import DeviceNotFoundError
+from devicefleet.sessions import DeviceBusyError, SessionOwnershipError
 from devicefleet.skilltext import load_skill_markdown
 from devicefleet.transport.http import HttpTransport
 from devicefleet.transport.local import LocalTransport
@@ -53,10 +56,14 @@ def _transport(ctx: typer.Context) -> LocalTransport | HttpTransport:
         return existing
     settings: Settings = ctx.obj["settings"]
     remote = ctx.obj.get("remote_url") or settings.remote_url
+    agent = ctx.obj.get("agent") or settings.agent
+    token = ctx.obj.get("token") or settings.token
     if remote:
-        transport: LocalTransport | HttpTransport = HttpTransport(remote)
+        transport: LocalTransport | HttpTransport = HttpTransport(
+            remote, token=token, agent_label=agent
+        )
     else:
-        transport = LocalTransport(_fleet(ctx))
+        transport = LocalTransport(_fleet(ctx), agent_label=agent)
     ctx.obj["transport"] = transport
     return transport
 
@@ -85,6 +92,14 @@ def main(
         Optional[str],
         typer.Option("--remote", help="Talk to a fleet host URL instead of local state."),
     ] = None,
+    token: Annotated[
+        Optional[str],
+        typer.Option("--token", help="Shared secret for a remote fleet host (DEVICEFLEET_TOKEN)."),
+    ] = None,
+    agent: Annotated[
+        Optional[str],
+        typer.Option("--agent", help="Agent label for session ownership (DEVICEFLEET_AGENT)."),
+    ] = None,
     version: Annotated[
         bool,
         typer.Option(
@@ -96,7 +111,14 @@ def main(
     ] = False,
 ) -> None:
     del version
-    ctx.obj = {"settings": _settings(home), "remote_url": remote, "fleet": None}
+    settings = _settings(home)
+    ctx.obj = {
+        "settings": settings,
+        "remote_url": remote,
+        "token": token or settings.token,
+        "agent": (agent or settings.agent or "anonymous").strip() or "anonymous",
+        "fleet": None,
+    }
 
 
 @app.command()
@@ -145,6 +167,13 @@ def serve(
     settings: Settings = ctx.obj["settings"]
     bind_host = host or settings.host
     bind_port = port or settings.port
+    token = ctx.obj.get("token") or settings.token
+    try:
+        validate_serve_bind(bind_host, token)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if token:
+        settings.token = token
     console.print(f"Serving devicefleet on http://{bind_host}:{bind_port}")
     uvicorn.run(create_app(_fleet(ctx)), host=bind_host, port=bind_port)
 
@@ -209,15 +238,13 @@ def devices_register(
     tag: Annotated[Optional[list[str]], typer.Option("--tag")] = None,
 ) -> None:
     """Manually add a phone to the registry."""
-    from devicefleet.models import ProviderKind
-
     if not ref.strip():
         raise typer.BadParameter("--ref (adb serial or cloud handle) is required")
     try:
         kind = ProviderKind(provider)
     except ValueError as exc:
         raise typer.BadParameter("provider must be adb, stub, or cloud") from exc
-    record = _fleet(ctx).registry.register(
+    record = _transport(ctx).register_device(
         device_id=device_id,
         provider=kind,
         provider_ref=ref,
@@ -233,7 +260,10 @@ def devices_rm(
     device_id: Annotated[str, typer.Argument()],
 ) -> None:
     """Remove a phone from the registry."""
-    removed = _fleet(ctx).registry.remove(device_id)
+    try:
+        removed = _transport(ctx).remove_device(device_id)
+    except (DeviceInUseError, DeviceNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print(f"removed {removed.id}")
 
 
@@ -242,13 +272,17 @@ def session_start(
     ctx: typer.Context,
     device: Annotated[Optional[str], typer.Option("--device", "-d")] = None,
     tag: Annotated[Optional[list[str]], typer.Option("--tag")] = None,
-    agent: Annotated[str, typer.Option("--agent")] = "anonymous",
+    agent: Annotated[Optional[str], typer.Option("--agent")] = None,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Lease an idle device. Other agents cannot take it until you stop."""
-    session = _transport(ctx).start_session(
-        device_id=device, tags=tag or None, agent_label=agent
-    )
+    label = _use_agent(ctx, agent)
+    try:
+        session = _transport(ctx).start_session(
+            device_id=device, tags=tag or None, agent_label=label
+        )
+    except (DeviceNotFoundError, DeviceBusyError, FleetError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _emit(session.model_dump(mode="json"), True)
         return
@@ -265,8 +299,12 @@ def session_attach(
     agent: Annotated[Optional[str], typer.Option("--agent")] = None,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    """Rejoin an existing active session."""
-    session = _transport(ctx).attach_session(session_id, agent_label=agent)
+    """Rejoin an existing active session you already own."""
+    label = _use_agent(ctx, agent)
+    try:
+        session = _transport(ctx).attach_session(session_id, agent_label=label)
+    except SessionOwnershipError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _emit(session.model_dump(mode="json"), True)
         return
@@ -295,31 +333,47 @@ def session_stop(
 ) -> None:
     """Release a session so the device is free again."""
     transport = _transport(ctx)
-    resolved = session_id or transport.current_session_id()
+    if session_id:
+        resolved = session_id
+    elif isinstance(transport, HttpTransport):
+        raise typer.BadParameter("pass --session / the session id when talking to a remote host")
+    else:
+        resolved = transport.current_session_id()
     if not resolved:
-        raise typer.BadParameter("session id required (or start a session first)")
-    session = transport.stop_session(resolved)
+        raise typer.BadParameter("session id required (or start a session first as this agent)")
+    try:
+        session = transport.stop_session(resolved)
+    except SessionOwnershipError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _emit(session.model_dump(mode="json"), True)
         return
     console.print(f"stopped {session.id} ({session.device_id})")
 
 
+def _use_agent(ctx: typer.Context, agent: str | None) -> str:
+    label = (agent or ctx.obj.get("agent") or "anonymous").strip() or "anonymous"
+    if ctx.obj.get("agent") != label:
+        ctx.obj["agent"] = label
+        ctx.obj["transport"] = None
+    return label
+
+
 def _resolve_session(ctx: typer.Context, session_id: str | None) -> str:
     transport = _transport(ctx)
     if session_id:
         return session_id
-    if not isinstance(transport, LocalTransport):
-        current = transport.current_session_id()
-        if current:
-            return current
+    if isinstance(transport, HttpTransport):
         raise typer.BadParameter("pass --session when talking to a remote host")
-    return transport.fleet.resolve_session_id(session_id)
+    return transport.fleet.resolve_session_id(None, agent_label=ctx.obj.get("agent"))
 
 
 def _run_helper(ctx: typer.Context, request: ActionRequest, session: str | None, as_json: bool) -> None:
     session_id = _resolve_session(ctx, session)
-    result = _transport(ctx).run(session_id, request)
+    try:
+        result = _transport(ctx).run(session_id, request)
+    except SessionOwnershipError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _emit(result.model_dump(mode="json"), True)
         return

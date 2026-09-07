@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from devicefleet.models import DeviceRecord, ProviderKind, utcnow
+from devicefleet.models import DeviceRecord, DeviceStatus, ProviderKind, utcnow
 from devicefleet.store import YamlStore
 
 
@@ -79,6 +79,7 @@ class DeviceRegistry:
         tags: list[str] | None = None,
         metadata: dict[str, str] | None = None,
         notes: str = "",
+        last_status: DeviceStatus | None = None,
     ) -> DeviceRecord:
         """Add a device. Re-registering the same id updates fields."""
         existing: DeviceRecord | None
@@ -95,6 +96,8 @@ class DeviceRegistry:
             metadata=metadata or (existing.metadata if existing else {}),
             registered_at=existing.registered_at if existing else utcnow(),
             last_seen=existing.last_seen if existing else None,
+            last_status=last_status
+            or (existing.last_status if existing else DeviceStatus.UNKNOWN),
             notes=notes or (existing.notes if existing else ""),
         )
         return self.upsert(record)
@@ -113,6 +116,15 @@ class DeviceRegistry:
             raise DeviceNotFoundError(f"device not found: {device_id}")
         self._write_all(kept)
         return removed
+
+    def set_status(self, device_id: str, status: DeviceStatus) -> DeviceRecord:
+        """Persist last known provider availability (not occupancy)."""
+        if status is DeviceStatus.BUSY:
+            raise ValueError("BUSY is session occupancy, not a persisted provider status")
+        device = self.get(device_id)
+        if device.last_status is status:
+            return device
+        return self.upsert(device.model_copy(update={"last_status": status}))
 
     def touch(self, device_id: str, when: datetime | None = None) -> DeviceRecord:
         """Update last_seen after a successful discover or action."""

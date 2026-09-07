@@ -20,7 +20,7 @@ from devicefleet.models import (
 )
 from devicefleet.providers.adb import LocalAdbProvider
 from devicefleet.providers.base import DeviceProvider, ProviderError
-from devicefleet.providers.stub import StubCloudProvider
+from devicefleet.providers.stub import DEFAULT_HANDLE, StubCloudProvider
 from devicefleet.registry import DeviceNotFoundError, DeviceRegistry
 from devicefleet.sessions import SessionError, SessionManager, SessionNotFoundError
 from devicefleet.store import YamlStore
@@ -28,6 +28,10 @@ from devicefleet.store import YamlStore
 
 class FleetError(RuntimeError):
     """High-level fleet operation failed."""
+
+
+class DeviceInUseError(FleetError):
+    """A device cannot be removed while a session holds it."""
 
 
 class Fleet:
@@ -49,6 +53,7 @@ class Fleet:
         )
         self.stub = StubCloudProvider(state_path=self.settings.stub_state_path)
         self.registry.ensure_stub_demo()
+        self._rehydrate_stub_registry()
 
     def provider_for(self, kind: ProviderKind) -> DeviceProvider:
         if kind is ProviderKind.ADB:
@@ -75,6 +80,7 @@ class Fleet:
                 try:
                     existing = self.registry.get(device_id)
                     self.registry.touch(existing.id)
+                    self.registry.set_status(existing.id, item.status)
                 except DeviceNotFoundError:
                     self.registry.register(
                         device_id=device_id,
@@ -83,7 +89,10 @@ class Fleet:
                         display_name=item.display_name,
                         tags=item.suggested_tags,
                         metadata=item.metadata,
+                        last_status=item.status,
                     )
+                    if item.provider is ProviderKind.STUB:
+                        self.stub.ensure(item.provider_ref, item.display_name)
         return found
 
     def list_devices(
@@ -91,10 +100,21 @@ class Fleet:
         tags: list[str] | None = None,
         provider: ProviderKind | None = None,
     ) -> list[DeviceListItem]:
+        live = self._probe_live_statuses()
         items: list[DeviceListItem] = []
         for device in self.registry.find(tags=tags, provider=provider):
             session = self.sessions.active_for_device(device.id)
-            status = DeviceStatus.BUSY if session else DeviceStatus.ONLINE
+            if session:
+                status = DeviceStatus.BUSY
+            else:
+                status = live.get((device.provider, device.provider_ref), device.last_status)
+                if status is DeviceStatus.UNKNOWN:
+                    status = live.get(
+                        (device.provider, device.provider_ref), DeviceStatus.UNKNOWN
+                    )
+                if status is not DeviceStatus.BUSY and status != device.last_status:
+                    self.registry.set_status(device.id, status)
+                    device = self.registry.get(device.id)
             items.append(
                 DeviceListItem(
                     device=device,
@@ -105,6 +125,40 @@ class Fleet:
             )
         return items
 
+    def register_device(
+        self,
+        device_id: str,
+        provider: ProviderKind,
+        provider_ref: str,
+        display_name: str | None = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, str] | None = None,
+        notes: str = "",
+    ) -> DeviceRecord:
+        """Add a phone to the host registry (used by CLI and HTTP)."""
+        record = self.registry.register(
+            device_id=device_id,
+            provider=provider,
+            provider_ref=provider_ref,
+            display_name=display_name,
+            tags=tags,
+            metadata=metadata,
+            notes=notes,
+        )
+        if record.provider is ProviderKind.STUB:
+            self.stub.ensure(record.provider_ref, record.display_name)
+        return record
+
+    def remove_device(self, device_id: str) -> DeviceRecord:
+        """Remove a phone. Refuses if an active session holds it."""
+        busy = self.sessions.active_for_device(device_id)
+        if busy is not None:
+            raise DeviceInUseError(
+                f"device {device_id} is held by session {busy.id} "
+                f"({busy.agent_label}); stop the session first"
+            )
+        return self.registry.remove(device_id)
+
     def start_session(
         self,
         device_id: str | None = None,
@@ -112,37 +166,53 @@ class Fleet:
         agent_label: str = "anonymous",
     ) -> SessionRecord:
         device = self._select_idle_device(device_id=device_id, tags=tags)
-        session = self.sessions.start(device.id, agent_label=agent_label)
-        self._set_current_session(session.id)
+        label = agent_label.strip() or "anonymous"
+        session = self.sessions.start(
+            device.id,
+            agent_label=label,
+            metadata={
+                "provider": device.provider.value,
+                "provider_ref": device.provider_ref,
+            },
+        )
+        self._set_current_session(session.id, label)
         return session
 
     def attach_session(
         self, session_id: str, agent_label: str | None = None
     ) -> SessionRecord:
         session = self.sessions.attach(session_id, agent_label=agent_label)
-        self._set_current_session(session.id)
+        self._set_current_session(session.id, session.agent_label)
         return session
 
-    def stop_session(self, session_id: str) -> SessionRecord:
+    def stop_session(
+        self, session_id: str, agent_label: str | None = None
+    ) -> SessionRecord:
+        if agent_label:
+            self.sessions.require_owner(session_id, agent_label)
         session = self.sessions.stop(session_id)
-        current = self.current_session_id()
-        if current == session_id:
-            self._set_current_session(None)
-        device = self.registry.get(session.device_id)
-        if device.provider in {ProviderKind.STUB, ProviderKind.CLOUD}:
-            # Local ADB phones stay physically attached; cloud handles are leased.
-            if device.provider_ref != "stub-phone-1":
-                try:
-                    self.stub.release_cloud(device.provider_ref)
-                except ProviderError:
-                    pass
+        self._clear_current_session(session.id, session.agent_label)
+        self._release_cloud_handle(session)
         return session
 
-    def run(self, session_id: str, request: ActionRequest) -> ActionResult:
-        session = self.sessions.get(session_id)
-        if session.status != SessionStatus.ACTIVE:
-            raise SessionError(f"session {session_id} is not active")
-        device = self.registry.get(session.device_id)
+    def run(
+        self,
+        session_id: str,
+        request: ActionRequest,
+        agent_label: str | None = None,
+    ) -> ActionResult:
+        if agent_label:
+            session = self.sessions.require_owner(session_id, agent_label)
+        else:
+            session = self.sessions.get(session_id)
+            if session.status != SessionStatus.ACTIVE:
+                raise SessionError(f"session {session_id} is not active")
+        try:
+            device = self.registry.get(session.device_id)
+        except DeviceNotFoundError:
+            raise DeviceNotFoundError(
+                f"device {session.device_id} for session {session_id} is gone"
+            ) from None
         provider = self.provider_for(device.provider)
         handle = device.provider_ref
         artifact: str | None = None
@@ -221,20 +291,34 @@ class Fleet:
             display_name=discovered.display_name,
             tags=discovered.suggested_tags,
             metadata=discovered.metadata,
+            last_status=DeviceStatus.ONLINE,
         )
 
-    def current_session_id(self) -> str | None:
+    def current_session_id(self, agent_label: str | None = None) -> str | None:
+        """Return this agent's remembered session, never another agent's."""
         if self.settings.current_session:
             return self.settings.current_session
+        agent = (agent_label or self.settings.agent or "anonymous").strip() or "anonymous"
         document = self.state_store.load()
-        value = document.get("current_session")
-        return value if isinstance(value, str) and value else None
+        mapping = document.get("current_sessions")
+        if isinstance(mapping, dict):
+            value = mapping.get(agent)
+            if isinstance(value, str) and value:
+                return value
+        if agent == "anonymous":
+            legacy = document.get("current_session")
+            if isinstance(legacy, str) and legacy:
+                return legacy
+        return None
 
-    def resolve_session_id(self, session_id: str | None) -> str:
-        resolved = session_id or self.current_session_id()
+    def resolve_session_id(
+        self, session_id: str | None, agent_label: str | None = None
+    ) -> str:
+        resolved = session_id or self.current_session_id(agent_label)
         if not resolved:
             raise SessionNotFoundError(
-                "no session id given and no current session; run `devicefleet session start`"
+                "no session id given and no current session for this agent; "
+                "run `devicefleet session start` or pass --session"
             )
         return resolved
 
@@ -259,8 +343,24 @@ class Fleet:
             )
         return idle[0]
 
-    def _set_current_session(self, session_id: str | None) -> None:
-        self.state_store.save({"current_session": session_id})
+    def _set_current_session(self, session_id: str | None, agent_label: str) -> None:
+        agent = agent_label.strip() or "anonymous"
+        document = self.state_store.load()
+        mapping = document.get("current_sessions")
+        if not isinstance(mapping, dict):
+            mapping = {}
+        else:
+            mapping = dict(mapping)
+        if session_id:
+            mapping[agent] = session_id
+        else:
+            mapping.pop(agent, None)
+        self.state_store.save({"current_sessions": mapping})
+
+    def _clear_current_session(self, session_id: str, agent_label: str) -> None:
+        current = self.current_session_id(agent_label)
+        if current == session_id:
+            self._set_current_session(None, agent_label)
 
     def _write_artifact(self, session_id: str, name: str, data: bytes) -> Path:
         folder = self.settings.artifacts_dir / session_id
@@ -268,3 +368,53 @@ class Fleet:
         path = folder / name
         path.write_bytes(data)
         return path
+
+    def _rehydrate_stub_registry(self) -> None:
+        for device in self.registry.list_devices():
+            if device.provider is ProviderKind.STUB:
+                self.stub.ensure(device.provider_ref, device.display_name)
+
+    def _probe_live_statuses(
+        self,
+    ) -> dict[tuple[ProviderKind, str], DeviceStatus]:
+        live: dict[tuple[ProviderKind, str], DeviceStatus] = {}
+        for device in self.registry.list_devices():
+            if device.provider is ProviderKind.STUB:
+                online = self.stub.health(device.provider_ref)
+                live[(ProviderKind.STUB, device.provider_ref)] = (
+                    DeviceStatus.ONLINE if online else DeviceStatus.OFFLINE
+                )
+        if self.adb.available():
+            try:
+                for item in self.adb.discover():
+                    live[(ProviderKind.ADB, item.provider_ref)] = item.status
+            except ProviderError:
+                pass
+            for device in self.registry.list_devices():
+                if device.provider is ProviderKind.ADB:
+                    live.setdefault(
+                        (ProviderKind.ADB, device.provider_ref), DeviceStatus.OFFLINE
+                    )
+        else:
+            for device in self.registry.list_devices():
+                if device.provider is ProviderKind.ADB:
+                    live[(ProviderKind.ADB, device.provider_ref)] = DeviceStatus.OFFLINE
+        return live
+
+    def _release_cloud_handle(self, session: SessionRecord) -> None:
+        handle = session.metadata.get("provider_ref")
+        kind = session.metadata.get("provider")
+        try:
+            device = self.registry.get(session.device_id)
+            handle = device.provider_ref
+            kind = device.provider.value
+        except DeviceNotFoundError:
+            pass
+        if kind not in {ProviderKind.STUB.value, ProviderKind.CLOUD.value}:
+            return
+        if not handle or handle == DEFAULT_HANDLE:
+            return
+        try:
+            self.stub.release_cloud(handle)
+        except ProviderError:
+            pass

@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from devicefleet.models import SessionStatus
-from devicefleet.sessions import DeviceBusyError, SessionManager, SessionNotFoundError
+from devicefleet.sessions import (
+    DeviceBusyError,
+    SessionManager,
+    SessionNotFoundError,
+    SessionOwnershipError,
+)
 from devicefleet.store import YamlStore
 
 
@@ -28,8 +33,12 @@ def test_exclusive_lease(tmp_path: Path) -> None:
 def test_attach_and_missing(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     session = manager.start("stub-demo", agent_label="coder")
-    attached = manager.attach(session.id, agent_label="coder-2")
-    assert attached.agent_label == "coder-2"
+    attached = manager.attach(session.id, agent_label="coder")
+    assert attached.id == session.id
+    with pytest.raises(SessionOwnershipError):
+        manager.attach(session.id, agent_label="coder-2")
+    with pytest.raises(SessionOwnershipError):
+        manager.attach(session.id, agent_label=None)
     with pytest.raises(SessionNotFoundError):
         manager.get("ses_missing")
 

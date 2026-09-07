@@ -232,9 +232,11 @@ def _parse_adb_extras(tokens: list[str]) -> dict[str, str]:
 
 
 def _suggest_id(serial: str, extras: dict[str, str]) -> str:
-    model = extras.get("model") or extras.get("device") or serial
+    model = extras.get("model") or extras.get("device") or ""
     slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in model).strip("-")
-    return slug or serial
+    if slug:
+        return f"{slug}-{serial}"
+    return serial
 
 
 def _require_point(x: int, y: int) -> None:

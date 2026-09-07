@@ -8,7 +8,9 @@ from devicefleet.models import (
     ActionRequest,
     ActionResult,
     DeviceListItem,
+    DeviceRecord,
     DiscoveredDevice,
+    ProviderKind,
     SessionRecord,
 )
 
@@ -21,6 +23,17 @@ class FleetTransport(Protocol):
     def list_devices(
         self, tags: list[str] | None = None
     ) -> list[DeviceListItem]: ...
+
+    def register_device(
+        self,
+        device_id: str,
+        provider: ProviderKind,
+        provider_ref: str,
+        display_name: str | None = None,
+        tags: list[str] | None = None,
+    ) -> DeviceRecord: ...
+
+    def remove_device(self, device_id: str) -> DeviceRecord: ...
 
     def start_session(
         self,

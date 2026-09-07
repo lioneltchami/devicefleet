@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from devicefleet.store import YamlStore
 DEFAULT_WIDTH = 1080
 DEFAULT_HEIGHT = 1920
 DEFAULT_HANDLE = "stub-phone-1"
+MAX_ACTIONS = 200
+MAX_TEXT = 4096
 
 
 @dataclass
@@ -25,7 +28,7 @@ class _VirtualPhone:
     last_text: str = ""
     last_key: str = ""
     released: bool = False
-    actions: list[str] = field(default_factory=list)
+    actions: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_ACTIONS))
     focused: str = "home"
 
     def log(self, message: str) -> None:
@@ -103,7 +106,7 @@ class StubCloudProvider(DeviceProvider):
         if text is None:
             raise ValueError("text is required")
         phone = self._require(handle)
-        phone.last_text += text
+        phone.last_text = (phone.last_text + text)[-MAX_TEXT:]
         phone.log(f"type {text!r}")
         self._persist()
 
@@ -152,14 +155,40 @@ class StubCloudProvider(DeviceProvider):
         """Allocate another virtual phone. Used to demo cloud acquire."""
         if spec.platform != "android":
             raise ProviderError("StubCloudProvider only simulates Android")
-        index = len(self._phones) + 1
-        handle = f"stub-phone-{index}"
-        name = spec.model or f"Stub Cloud Phone {index}"
+        handle = self._next_handle()
+        name = spec.model or f"Stub Cloud Phone {handle}"
         phone = _VirtualPhone(handle=handle, display_name=name)
         self._phones[handle] = phone
         phone.log(f"provisioned platform={spec.platform}")
         self._persist()
         return self._as_discovered(phone, tags=list(spec.tags))
+
+    def ensure(self, handle: str, display_name: str | None = None) -> None:
+        """Rehydrate a registry stub so leftover YAML devices stay usable."""
+        if not handle or not handle.strip():
+            raise ValueError("device handle is required")
+        phone = self._phones.get(handle)
+        if phone is None:
+            self._phones[handle] = _VirtualPhone(
+                handle=handle,
+                display_name=display_name or handle,
+            )
+            self._persist()
+            return
+        if phone.released:
+            phone.released = False
+            phone.log("rehydrated")
+            if display_name:
+                phone.display_name = display_name
+            self._persist()
+
+    def _next_handle(self) -> str:
+        index = 1
+        while True:
+            handle = f"stub-phone-{index}"
+            if handle not in self._phones:
+                return handle
+            index += 1
 
     def release_cloud(self, handle: str) -> None:
         phone = self._require(handle)
@@ -240,17 +269,17 @@ def _phone_from_dict(raw: dict[str, object]) -> _VirtualPhone:
     if isinstance(tap_raw, list) and len(tap_raw) == 2:
         last_tap = (int(tap_raw[0]), int(tap_raw[1]))
     actions_raw = raw.get("actions") or []
-    actions = [str(item) for item in actions_raw] if isinstance(actions_raw, list) else []
+    action_items = [str(item) for item in actions_raw] if isinstance(actions_raw, list) else []
     return _VirtualPhone(
         handle=str(raw.get("handle") or DEFAULT_HANDLE),
         display_name=str(raw.get("display_name") or "Stub Demo Phone"),
         width=int(raw.get("width") or DEFAULT_WIDTH),
         height=int(raw.get("height") or DEFAULT_HEIGHT),
         last_tap=last_tap,
-        last_text=str(raw.get("last_text") or ""),
+        last_text=str(raw.get("last_text") or "")[-MAX_TEXT:],
         last_key=str(raw.get("last_key") or ""),
         released=bool(raw.get("released")),
-        actions=actions,
+        actions=deque(action_items[-MAX_ACTIONS:], maxlen=MAX_ACTIONS),
         focused=str(raw.get("focused") or "home"),
     )
 

@@ -44,7 +44,7 @@ State lives under `$DEVICEFLEET_HOME` (default `~/.devicefleet`):
 
 - `devices.yaml` — registered phones
 - `sessions.yaml` — leases
-- `state.yaml` — current session id for the local CLI
+- `state.yaml` — per-agent current session ids for the local CLI
 - `stub-state.yaml` — virtual phone state so CLI commands share one stub
 - `artifacts/<session>/` — screenshots and UI dumps
 
@@ -88,7 +88,7 @@ Do not special-case the CLI or the HTTP routes. New farms should be invisible ab
 
 - iOS via macOS iPhone Mirroring / Accessibility — needs a separate provider, not an ADB look-alike
 - Production BrowserStack / Device Farm adapters
-- Authn on the HTTP host (v0 is a trusted lab network)
+- Richer authn than a shared `DEVICEFLEET_TOKEN` (v0 uses bearer / `X-Devicefleet-Token` plus agent ownership)
 - Rich IME / unicode input beyond `adb shell input text`
 - Cross-process file locks if many local processes share one `DEVICEFLEET_HOME`
 

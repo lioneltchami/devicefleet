@@ -143,6 +143,18 @@ class DeviceRegistry:
 
         return self._store.update(mutator)
 
+    def get_by_ref(
+        self, provider: ProviderKind, provider_ref: str
+    ) -> DeviceRecord | None:
+        """Return the device registered for this backend handle, if any."""
+        ref = provider_ref.strip()
+        if not ref:
+            raise ValueError("provider_ref must not be empty")
+        for device in self._read_all():
+            if device.provider is provider and device.provider_ref == ref:
+                return device
+        return None
+
     def remove(self, device_id: str) -> DeviceRecord:
         """Delete a device from the registry."""
 
@@ -168,16 +180,44 @@ class DeviceRegistry:
         """Persist last known provider availability (not occupancy)."""
         if status is DeviceStatus.BUSY:
             raise ValueError("BUSY is session occupancy, not a persisted provider status")
-        device = self.get(device_id)
-        if device.last_status is status:
-            return device
-        return self.upsert(device.model_copy(update={"last_status": status}))
+        cleaned = device_id.strip()
+
+        def mutator(document: dict[str, object]) -> DeviceRecord:
+            devices = self._parse(document)
+            found = next((item for item in devices if item.id == cleaned), None)
+            if found is None:
+                raise DeviceNotFoundError(f"device not found: {cleaned}")
+            if found.last_status is status:
+                return found
+            updated = found.model_copy(update={"last_status": status})
+            kept = [item for item in devices if item.id != cleaned]
+            kept.append(updated)
+            kept.sort(key=lambda item: item.registered_at)
+            document.clear()
+            document.update(self._dump(kept))
+            return updated
+
+        return self._store.update(mutator)
 
     def touch(self, device_id: str, when: datetime | None = None) -> DeviceRecord:
         """Update last_seen after a successful discover or action."""
-        device = self.get(device_id)
-        updated = device.model_copy(update={"last_seen": when or utcnow()})
-        return self.upsert(updated)
+        cleaned = device_id.strip()
+        stamp = when or utcnow()
+
+        def mutator(document: dict[str, object]) -> DeviceRecord:
+            devices = self._parse(document)
+            found = next((item for item in devices if item.id == cleaned), None)
+            if found is None:
+                raise DeviceNotFoundError(f"device not found: {cleaned}")
+            updated = found.model_copy(update={"last_seen": stamp})
+            kept = [item for item in devices if item.id != cleaned]
+            kept.append(updated)
+            kept.sort(key=lambda item: item.registered_at)
+            document.clear()
+            document.update(self._dump(kept))
+            return updated
+
+        return self._store.update(mutator)
 
     def ensure_stub_demo(self) -> DeviceRecord:
         """Guarantee a demo device exists so the stub path works offline."""

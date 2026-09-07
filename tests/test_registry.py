@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from devicefleet.models import DeviceRecord, ProviderKind
+from devicefleet.models import DeviceRecord, DeviceStatus, ProviderKind
 from devicefleet.registry import DeviceNotFoundError, DeviceRegistry, DuplicateDeviceError
 from devicefleet.store import YamlStore
 
@@ -169,3 +169,36 @@ def test_concurrent_upsert_keeps_all_devices(tmp_path: Path) -> None:
         thread.join()
     ids = {item.id for item in registry.list_devices()}
     assert ids == {f"dev-{i}" for i in range(16)}
+
+
+def test_get_by_ref(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.register("custom", ProviderKind.STUB, "stub-phone-8")
+    found = registry.get_by_ref(ProviderKind.STUB, "stub-phone-8")
+    assert found is not None
+    assert found.id == "custom"
+    assert registry.get_by_ref(ProviderKind.ADB, "stub-phone-8") is None
+
+
+def test_set_status_does_not_clobber_concurrent_tags(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.register("phone", ProviderKind.STUB, "h1", tags=["keep"])
+
+    def status_loop() -> None:
+        for _ in range(80):
+            registry.set_status("phone", DeviceStatus.ONLINE)
+            registry.set_status("phone", DeviceStatus.OFFLINE)
+
+    def tag_writer() -> None:
+        for index in range(80):
+            registry.register("phone", ProviderKind.STUB, "h1", tags=[f"t{index}"])
+
+    threads = [threading.Thread(target=status_loop), threading.Thread(target=tag_writer)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    loaded = registry.get("phone")
+    assert loaded.tags
+    assert loaded.tags[0] == "keep" or loaded.tags[0].startswith("t")
+    assert loaded.provider_ref == "h1"

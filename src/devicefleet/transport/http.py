@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -49,10 +51,10 @@ class HttpTransport:
         return [DiscoveredDevice.model_validate(item) for item in data]
 
     def list_devices(self, tags: list[str] | None = None) -> list[DeviceListItem]:
-        params: dict[str, str] = {}
+        params: list[tuple[str, str]] = []
         if tags:
-            params["tags"] = ",".join(tags)
-        data = self._request("GET", "/devices", params=params)
+            params = [("tag", item) for item in tags]
+        data = self._request("GET", "/devices", params=params or None)
         return [DeviceListItem.model_validate(item) for item in data]
 
     def register_device(
@@ -75,7 +77,7 @@ class HttpTransport:
         return DeviceRecord.model_validate(data)
 
     def remove_device(self, device_id: str) -> DeviceRecord:
-        data = self._request("DELETE", f"/devices/{device_id}")
+        data = self._request("DELETE", f"/devices/{_path_seg(device_id)}")
         return DeviceRecord.model_validate(data)
 
     def start_session(
@@ -105,7 +107,7 @@ class HttpTransport:
             self._remember_secret(session_id, session_secret)
         data = self._request(
             "POST",
-            f"/sessions/{session_id}/attach",
+            f"/sessions/{_path_seg(session_id)}/attach",
             json={"agent_label": label},
             session_id=session_id,
         )
@@ -122,13 +124,13 @@ class HttpTransport:
         return [SessionRecord.model_validate(item) for item in data]
 
     def stop_session(self, session_id: str) -> SessionRecord:
-        data = self._request("DELETE", f"/sessions/{session_id}", session_id=session_id)
+        data = self._request("DELETE", f"/sessions/{_path_seg(session_id)}", session_id=session_id)
         return SessionRecord.model_validate(data)
 
     def run(self, session_id: str, request: ActionRequest) -> ActionResult:
         data = self._request(
             "POST",
-            f"/sessions/{session_id}/actions",
+            f"/sessions/{_path_seg(session_id)}/actions",
             json=request.model_dump(mode="json"),
             session_id=session_id,
         )
@@ -145,7 +147,9 @@ class HttpTransport:
 
     def _download_artifact(self, session_id: str, name: str) -> Path:
         raw = self._request_bytes(
-            "GET", f"/sessions/{session_id}/artifacts/{name}", session_id=session_id
+            "GET",
+            f"/sessions/{_path_seg(session_id)}/artifacts/{_path_seg(name)}",
+            session_id=session_id,
         )
         folder = self.artifacts_dir / session_id if self.artifacts_dir else Path(session_id)
         folder.mkdir(parents=True, exist_ok=True)
@@ -199,7 +203,7 @@ class HttpTransport:
         method: str,
         path: str,
         json: dict[str, Any] | None = None,
-        params: dict[str, str] | None = None,
+        params: Mapping[str, str] | Sequence[tuple[str, str]] | None = None,
         session_id: str | None = None,
     ) -> Any:
         url = f"{self.base_url}{path}"
@@ -228,6 +232,11 @@ class HttpTransport:
             detail = _error_detail(response)
             raise RuntimeError(f"fleet host {method} {path} failed: {detail}")
         return response.content
+
+
+def _path_seg(value: str) -> str:
+    """Encode a single URL path segment, including slashes."""
+    return quote(value, safe="")
 
 
 def _error_detail(response: httpx.Response) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
@@ -195,3 +196,72 @@ def test_duplicate_and_cloud_register(fleet: Fleet) -> None:
         },
     )
     assert cloud.status_code == 409
+
+
+def test_list_devices_preserves_comma_in_tag(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    created = client.post(
+        "/devices",
+        json={
+            "device_id": "comma-tag",
+            "provider": "stub",
+            "provider_ref": "stub-phone-6",
+            "tags": ["ios,lab"],
+        },
+    )
+    assert created.status_code == 200
+    matched = client.get("/devices", params=[("tag", "ios,lab")])
+    assert matched.status_code == 200
+    ids = [item["device"]["id"] for item in matched.json()]
+    assert "comma-tag" in ids
+    split = client.get("/devices", params={"tag": "ios"})
+    assert split.status_code == 200
+    split_ids = [item["device"]["id"] for item in split.json()]
+    assert "comma-tag" not in split_ids
+
+
+def test_remove_device_with_slash_id(fleet: Fleet) -> None:
+    client = TestClient(create_app(fleet))
+    created = client.post(
+        "/devices",
+        json={
+            "device_id": "lab/a",
+            "provider": "stub",
+            "provider_ref": "stub-phone-3",
+            "display_name": "Slash",
+        },
+    )
+    assert created.status_code == 200
+    removed = client.delete(f"/devices/{quote('lab/a', safe='')}")
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["id"] == "lab/a"
+
+
+def test_http_transport_encodes_tags_and_device_ids() -> None:
+    transport = HttpTransport("http://test")
+    seen: dict[str, object] = {}
+
+    def fake_request(method, path, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del json, session_id
+        seen["method"] = method
+        seen["path"] = path
+        seen["params"] = params
+        if method == "GET":
+            return []
+        return {
+            "id": "lab/a",
+            "display_name": "Slash",
+            "provider": "stub",
+            "provider_ref": "h1",
+            "tags": [],
+            "metadata": {},
+            "registered_at": "2024-01-01T00:00:00+00:00",
+            "last_status": "unknown",
+            "notes": "",
+        }
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    transport.list_devices(tags=["ios,lab", "android"])
+    assert seen["params"] == [("tag", "ios,lab"), ("tag", "android")]
+    transport.remove_device("lab/a")
+    assert seen["path"] == "/devices/lab%2Fa"

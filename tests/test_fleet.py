@@ -358,15 +358,19 @@ def test_adb_unknown_is_not_leaseable_but_stub_demo_is(fleet: Fleet) -> None:
     fleet.stop_session(demo.id, session_secret=demo.secret)
 
 
-def test_stop_releases_metadata_handle_not_reregistered_ref(fleet: Fleet) -> None:
+def test_stop_releases_metadata_handle_if_row_mutated(fleet: Fleet) -> None:
     extra = fleet.provision_stub()
     original = extra.provider_ref
     session = fleet.start_session(device_id=extra.id, agent_label="meta")
-    fleet.register_device(
-        device_id=extra.id,
-        provider=ProviderKind.STUB,
-        provider_ref="stub-phone-99",
-        display_name=extra.display_name,
+    with pytest.raises(DeviceInUseError, match="provider"):
+        fleet.register_device(
+            device_id=extra.id,
+            provider=ProviderKind.STUB,
+            provider_ref="stub-phone-99",
+            display_name=extra.display_name,
+        )
+    fleet.registry.register(
+        extra.id, ProviderKind.STUB, "stub-phone-99", display_name=extra.display_name
     )
     fleet.stub.ensure("stub-phone-99", extra.display_name)
     fleet.stop_session(session.id, session_secret=session.secret)
@@ -455,3 +459,65 @@ def test_attach_and_stop_leave_consistent_current(fleet: Fleet) -> None:
         thread.join()
     assert fleet.sessions.get(session.id).status.value == "released"
     assert fleet.current_session_id("owner") is None
+
+
+def test_discover_save_updates_user_chosen_id(fleet: Fleet) -> None:
+    fleet.register_device(
+        device_id="my-stub",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-8",
+        display_name="Custom",
+    )
+    fleet.discover(save=True)
+    ids = {item.device.id for item in fleet.list_devices()}
+    assert "my-stub" in ids
+    assert "stub-phone-8" not in ids
+    assert fleet.registry.get("my-stub").provider_ref == "stub-phone-8"
+
+
+def test_discover_save_does_not_overwrite_suggested_id_collision(fleet: Fleet) -> None:
+    fleet.register_device(
+        device_id="stub-phone-8",
+        provider=ProviderKind.ADB,
+        provider_ref="SERIAL-REAL",
+        display_name="Real Phone",
+    )
+    fleet.stub.ensure("unique-handle-8", "Colliding stub")
+    original = fleet.stub.discover
+
+    def extra_discover() -> list[DiscoveredDevice]:
+        items = original()
+        items.append(
+            DiscoveredDevice(
+                provider=ProviderKind.STUB,
+                provider_ref="unique-handle-8",
+                display_name="Colliding stub",
+                suggested_id="stub-phone-8",
+            )
+        )
+        return items
+
+    fleet.stub.discover = extra_discover  # type: ignore[method-assign]
+    fleet.discover(save=True)
+    kept = fleet.registry.get("stub-phone-8")
+    assert kept.provider is ProviderKind.ADB
+    assert kept.provider_ref == "SERIAL-REAL"
+    assert kept.display_name == "Real Phone"
+
+
+def test_local_start_preserves_remote_session_secrets(fleet: Fleet) -> None:
+    fleet.state_store.save(
+        {
+            "current_sessions": {"remote": "ses_old"},
+            "session_secrets": {"ses_remote": "cap_keepme"},
+        }
+    )
+    session = fleet.start_session(device_id="stub-demo", agent_label="local")
+    document = fleet.state_store.load()
+    secrets = document.get("session_secrets")
+    assert isinstance(secrets, dict)
+    assert secrets.get("ses_remote") == "cap_keepme"
+    mapping = document.get("current_sessions")
+    assert isinstance(mapping, dict)
+    assert mapping.get("local") == session.id
+    assert mapping.get("remote") == "ses_old"

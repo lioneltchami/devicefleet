@@ -105,22 +105,26 @@ class SessionManager:
         session_secret: str | None = None,
     ) -> SessionRecord:
         """Rejoin an existing active session. Requires the capability secret."""
-        session = self.require_secret(session_id, session_secret)
+        session = self.require_secret(session_id, session_secret, agent_label)
+        return session
+
+    def require_secret(
+        self,
+        session_id: str,
+        session_secret: str | None,
+        agent_label: str | None = None,
+    ) -> SessionRecord:
+        """Return the session only if it is active, the secret matches, and
+        an optional agent label matches the owner."""
+        session = self.get(session_id)
+        if session.status != SessionStatus.ACTIVE:
+            raise SessionError(f"session {session_id} is not active")
+        _check_secret(session, session_secret)
         caller = (agent_label or "").strip()
         if caller and caller != session.agent_label:
             raise SessionOwnershipError(
                 f"session {session_id} belongs to {session.agent_label}, not {caller}"
             )
-        return session
-
-    def require_secret(
-        self, session_id: str, session_secret: str | None
-    ) -> SessionRecord:
-        """Return the session only if it is active and the secret matches."""
-        session = self.get(session_id)
-        if session.status != SessionStatus.ACTIVE:
-            raise SessionError(f"session {session_id} is not active")
-        _check_secret(session, session_secret)
         return session
 
     def require_owner(self, session_id: str, agent_label: str | None) -> SessionRecord:

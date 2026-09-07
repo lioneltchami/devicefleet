@@ -92,23 +92,29 @@ class Fleet:
                 pass
         if save:
             for item in found:
+                by_ref = self.registry.get_by_ref(item.provider, item.provider_ref)
+                if by_ref is not None:
+                    self.registry.touch(by_ref.id)
+                    self.registry.set_status(by_ref.id, item.status)
+                    continue
                 device_id = item.suggested_id or item.provider_ref
                 try:
-                    existing = self.registry.get(device_id)
-                    self.registry.touch(existing.id)
-                    self.registry.set_status(existing.id, item.status)
+                    collision = self.registry.get(device_id)
                 except DeviceNotFoundError:
-                    self.registry.register(
-                        device_id=device_id,
-                        provider=item.provider,
-                        provider_ref=item.provider_ref,
-                        display_name=item.display_name,
-                        tags=item.suggested_tags,
-                        metadata=item.metadata,
-                        last_status=item.status,
-                    )
-                    if item.provider is ProviderKind.STUB:
-                        self.stub.ensure(item.provider_ref, item.display_name)
+                    collision = None
+                if collision is not None:
+                    continue
+                self.registry.register(
+                    device_id=device_id,
+                    provider=item.provider,
+                    provider_ref=item.provider_ref,
+                    display_name=item.display_name,
+                    tags=item.suggested_tags,
+                    metadata=item.metadata,
+                    last_status=item.status,
+                )
+                if item.provider is ProviderKind.STUB:
+                    self.stub.ensure(item.provider_ref, item.display_name)
         return found
 
     def list_devices(
@@ -157,11 +163,45 @@ class Fleet:
                 "cannot register a CLOUD device until a cloud adapter is configured"
             )
         ref = provider_ref.strip()
+        cleaned = device_id.strip()
+        try:
+            existing = self.registry.get(cleaned)
+        except DeviceNotFoundError:
+            existing = None
+        identity_changed = existing is not None and (
+            existing.provider is not provider or existing.provider_ref != ref
+        )
+        if identity_changed:
+            with self._lease_lock(cleaned):
+                busy = self.sessions.active_for_device(cleaned)
+                if busy is not None:
+                    raise DeviceInUseError(
+                        f"device {cleaned} is held by session {busy.id} "
+                        f"({busy.agent_label}); stop the session before changing "
+                        "provider or provider_ref"
+                    )
+                return self._persist_register(
+                    cleaned, provider, ref, display_name, tags, metadata, notes
+                )
+        return self._persist_register(
+            cleaned, provider, ref, display_name, tags, metadata, notes
+        )
+
+    def _persist_register(
+        self,
+        device_id: str,
+        provider: ProviderKind,
+        provider_ref: str,
+        display_name: str | None,
+        tags: list[str] | None,
+        metadata: dict[str, str] | None,
+        notes: str | None,
+    ) -> DeviceRecord:
         try:
             record = self.registry.register(
                 device_id=device_id,
                 provider=provider,
-                provider_ref=ref,
+                provider_ref=provider_ref,
                 display_name=display_name,
                 tags=tags,
                 metadata=metadata,
@@ -239,7 +279,7 @@ class Fleet:
             if current.status is SessionStatus.RELEASED:
                 self._clear_current_session(current.id, current.agent_label)
                 return current
-            self.sessions.require_secret(session_id, session_secret)
+            self.sessions.require_secret(session_id, session_secret, agent_label)
             session = self.sessions.stop(session_id)
             self._clear_current_session(session.id, session.agent_label)
             if current.status is SessionStatus.ACTIVE:
@@ -255,15 +295,16 @@ class Fleet:
     ) -> ActionResult:
         peek = self.sessions.get(session_id)
         with self._lease_lock(peek.device_id):
-            return self._run_locked(session_id, request, session_secret)
+            return self._run_locked(session_id, request, session_secret, agent_label)
 
     def _run_locked(
         self,
         session_id: str,
         request: ActionRequest,
         session_secret: str | None,
+        agent_label: str | None,
     ) -> ActionResult:
-        session = self.sessions.require_secret(session_id, session_secret)
+        session = self.sessions.require_secret(session_id, session_secret, agent_label)
         try:
             device = self.registry.get(session.device_id)
         except DeviceNotFoundError:
@@ -436,7 +477,6 @@ class Fleet:
                 merged[agent] = session_id
             else:
                 merged.pop(agent, None)
-            document.clear()
             document["current_sessions"] = merged
 
         self.state_store.update(mutator)

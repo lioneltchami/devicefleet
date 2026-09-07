@@ -92,10 +92,9 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
 
     @protected.get("/devices", response_model=list[DeviceListItem])
     def list_devices(
-        tags: str | None = Query(default=None, description="Comma-separated tags"),
+        tag: list[str] | None = Query(default=None),
     ) -> list[DeviceListItem]:
-        tag_list = [part for part in (tags or "").split(",") if part.strip()]
-        return host_fleet.list_devices(tags=tag_list or None)
+        return host_fleet.list_devices(tags=tag)
 
     @protected.post("/devices/discover", response_model=list[DiscoveredDevice])
     def discover(body: DiscoverBody) -> list[DiscoveredDevice]:
@@ -115,7 +114,7 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
         except (ValueError, FleetError, DuplicateDeviceError) as exc:
             raise _http_error(exc) from exc
 
-    @protected.delete("/devices/{device_id}", response_model=DeviceRecord)
+    @protected.delete("/devices/{device_id:path}", response_model=DeviceRecord)
     def remove_device(device_id: str) -> DeviceRecord:
         try:
             return host_fleet.remove_device(device_id)

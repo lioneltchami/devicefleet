@@ -12,6 +12,7 @@ from devicefleet.models import (
     ProviderKind,
     SessionRecord,
 )
+from devicefleet.sessions import SessionOwnershipError
 
 
 class LocalTransport:
@@ -92,5 +93,11 @@ class LocalTransport:
         return self.fleet.current_session_id(self.agent_label)
 
     def _secret(self, session_id: str) -> str:
-        """Local processes can read the secret from the data directory."""
-        return self.fleet.sessions.get(session_id).secret
+        """Read the capability secret only for sessions this agent owns."""
+        session = self.fleet.sessions.get(session_id)
+        if session.agent_label != self.agent_label:
+            raise SessionOwnershipError(
+                f"session {session_id} belongs to {session.agent_label}, "
+                f"not {self.agent_label}"
+            )
+        return session.secret

@@ -11,6 +11,7 @@ from devicefleet.config import load_settings
 from devicefleet.fleet import Fleet
 from devicefleet.models import ActionName, ActionRequest
 from devicefleet.transport.local import LocalTransport
+from devicefleet.sessions import SessionOwnershipError
 
 
 def _authed_fleet(tmp_path: Path, token: str = "secret-token") -> Fleet:
@@ -122,4 +123,18 @@ def test_local_transport_uses_transport_agent(tmp_path: Path) -> None:
     result = transport.run(session.id, ActionRequest(name=ActionName.INFO))
     assert result.ok
     stopped = transport.stop_session(session.id)
+    assert stopped.status.value == "released"
+
+
+def test_local_transport_cannot_drive_another_agents_session(tmp_path: Path) -> None:
+    fleet = Fleet(load_settings(tmp_path / "home"))
+    extra = fleet.provision_stub()
+    alice = LocalTransport(fleet, agent_label="alice")
+    bob = LocalTransport(fleet, agent_label="bob")
+    session = alice.start_session(device_id=extra.id)
+    with pytest.raises(SessionOwnershipError, match="belongs to alice"):
+        bob.run(session.id, ActionRequest(name=ActionName.INFO))
+    with pytest.raises(SessionOwnershipError, match="belongs to alice"):
+        bob.stop_session(session.id)
+    stopped = alice.stop_session(session.id)
     assert stopped.status.value == "released"

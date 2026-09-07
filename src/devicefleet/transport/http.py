@@ -136,7 +136,7 @@ class HttpTransport:
         )
         result = ActionResult.model_validate(data)
         if result.artifact_path and self.artifacts_dir is not None:
-            name = Path(result.artifact_path).name
+            name = _artifact_basename(result.artifact_path)
             local = self._download_artifact(session_id, name)
             payload = dict(result.payload)
             payload["path"] = str(local)
@@ -243,6 +243,11 @@ class HttpTransport:
 def _path_seg(value: str) -> str:
     """Encode a single URL path segment, including slashes."""
     return quote(value, safe="")
+
+
+def _artifact_basename(path: str) -> str:
+    """Last path component from a POSIX or Windows host artifact path."""
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def _error_detail(response: httpx.Response) -> str:

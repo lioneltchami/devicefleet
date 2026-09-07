@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from devicefleet.api.app import create_app
 from devicefleet.fleet import Fleet
 from devicefleet.models import ActionName, ActionRequest
-from devicefleet.transport.http import HttpTransport
+from devicefleet.transport.http import HttpTransport, _artifact_basename
 
 
 def _owned(headers: dict[str, str], created: dict) -> dict[str, str]:
@@ -165,6 +165,50 @@ def test_artifact_download_and_http_transport(fleet: Fleet, tmp_path: Path) -> N
     assert Path(result.artifact_path or "").exists()
     assert dest in Path(result.artifact_path or "").parents
     assert Path(result.artifact_path or "").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_artifact_basename_accepts_windows_and_posix_paths() -> None:
+    assert (
+        _artifact_basename(r"C:\Users\fleet\artifacts\sess\screenshot.png")
+        == "screenshot.png"
+    )
+    assert _artifact_basename("/tmp/artifacts/sess/screenshot.png") == "screenshot.png"
+    assert _artifact_basename("screenshot.png") == "screenshot.png"
+
+
+def test_http_transport_downloads_windows_artifact_path(tmp_path: Path) -> None:
+    dest = tmp_path / "client-artifacts"
+    dest.mkdir()
+    transport = HttpTransport("http://test", artifacts_dir=dest, agent_label="api-test")
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    windows_path = r"C:\Users\fleet\artifacts\sess-1\screenshot.png"
+
+    def fake_request(method: str, path: str, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, params, session_id, json
+        if path.endswith("/actions"):
+            return {
+                "ok": True,
+                "action": ActionName.SCREENSHOT.value,
+                "session_id": "sess-1",
+                "device_id": "stub-demo",
+                "message": "screenshot",
+                "artifact_path": windows_path,
+                "payload": {"path": windows_path},
+            }
+        raise AssertionError(path)
+
+    def fake_bytes(method: str, path: str, session_id: str | None = None) -> bytes:
+        del method
+        assert path == f"/sessions/{session_id}/artifacts/screenshot.png"
+        return png
+
+    transport._request = fake_request  # type: ignore[method-assign]
+    transport._request_bytes = fake_bytes  # type: ignore[method-assign]
+    result = transport.run("sess-1", ActionRequest(name=ActionName.SCREENSHOT))
+    local = Path(result.artifact_path or "")
+    assert local.name == "screenshot.png"
+    assert dest in local.parents
+    assert local.read_bytes() == png
 
 
 def test_duplicate_and_cloud_register(fleet: Fleet) -> None:

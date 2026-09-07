@@ -14,9 +14,9 @@ from devicefleet.models import (
     DiscoveredDevice,
     ProviderKind,
 )
-from devicefleet.providers.base import DeviceProvider
+from devicefleet.providers.base import DeviceProvider, ProviderError
 from devicefleet.registry import DeviceNotFoundError
-from devicefleet.sessions import DeviceBusyError, SessionError
+from devicefleet.sessions import DeviceBusyError, SessionError, SessionOwnershipError
 
 
 class FakeCloudProvider(DeviceProvider):
@@ -27,6 +27,7 @@ class FakeCloudProvider(DeviceProvider):
     def __init__(self) -> None:
         self.devices: dict[str, DiscoveredDevice] = {}
         self.released: list[str] = []
+        self.fail_release = False
 
     def add(self, ref: str, name: str = "Farm Phone") -> DiscoveredDevice:
         item = DiscoveredDevice(
@@ -70,7 +71,10 @@ class FakeCloudProvider(DeviceProvider):
         return "<hierarchy/>"
 
     def release_cloud(self, handle: str) -> None:
-        self.released.append(handle)
+        if self.fail_release:
+            raise ProviderError("farm busy")
+        if handle not in self.released:
+            self.released.append(handle)
         self.devices.pop(handle, None)
 
     def health(self, handle: str) -> bool:
@@ -649,3 +653,51 @@ def test_user_registered_stub_survives_session_stop(fleet: Fleet) -> None:
     again = fleet.start_session(device_id="lab-stub", agent_label="lab-2")
     assert again.device_id == "lab-stub"
     fleet.stop_session(again.id, session_secret=again.secret)
+
+
+def test_spoofed_provisioned_metadata_does_not_deregister(fleet: Fleet) -> None:
+    custom = fleet.register_device(
+        device_id="lab-stub-meta",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-meta",
+        display_name="Lab Stub",
+        metadata={"provisioned": "true", "lab": "1"},
+    )
+    assert custom.metadata.get("provisioned") != "true"
+    assert custom.metadata.get("lab") == "1"
+    session = fleet.start_session(device_id="lab-stub-meta", agent_label="lab")
+    assert session.metadata.get("provisioned") != "true"
+    fleet.stop_session(session.id, session_secret=session.secret)
+    kept = fleet.registry.get("lab-stub-meta")
+    assert kept.provider_ref == "stub-phone-meta"
+    assert fleet.stub.health("stub-phone-meta") is True
+
+
+def test_released_stop_requires_secret(fleet: Fleet) -> None:
+    extra = fleet.provision_stub()
+    session = fleet.start_session(device_id=extra.id, agent_label="owner")
+    fleet.stop_session(session.id, session_secret=session.secret)
+    later = fleet.start_session(device_id="stub-demo", agent_label="owner")
+    with pytest.raises(SessionOwnershipError):
+        fleet.stop_session(session.id)
+    assert fleet.current_session_id("owner") == later.id
+    fleet.stop_session(session.id, session_secret=session.secret)
+    assert fleet.current_session_id("owner") == later.id
+    fleet.stop_session(later.id, session_secret=later.secret)
+
+
+def test_cloud_release_failure_keeps_session_active(fleet: Fleet) -> None:
+    cloud = FakeCloudProvider()
+    cloud.add("slot-retry", "Farm Retry")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    session = fleet.start_session(device_id="slot-retry", agent_label="farm")
+    cloud.fail_release = True
+    with pytest.raises(ProviderError, match="farm busy"):
+        fleet.stop_session(session.id, session_secret=session.secret)
+    assert fleet.sessions.get(session.id).status.value == "active"
+    assert cloud.released == []
+    cloud.fail_release = False
+    stopped = fleet.stop_session(session.id, session_secret=session.secret)
+    assert stopped.status.value == "released"
+    assert cloud.released == ["slot-retry"]

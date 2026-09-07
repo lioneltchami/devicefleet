@@ -198,3 +198,30 @@ def test_serve_port_zero_is_honored(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert result.exit_code == 0, result.output
     assert captured["port"] == 0
     assert "http://127.0.0.1:0" in result.stdout
+
+
+def test_run_missing_session_is_parameter_error(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["--home", str(tmp_path / "home"), "run", "info", "--session", "ses_missing"],
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in (result.stdout + result.stderr)
+    assert "session not found" in (result.stdout + result.stderr).lower() or result.exit_code == 2
+
+
+def test_session_stop_rejects_conflicting_ids(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "--home",
+            str(tmp_path / "home"),
+            "session",
+            "stop",
+            "ses_aaaaaa",
+            "--session",
+            "ses_bbbbbb",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "do not match" in (result.stdout + result.stderr)

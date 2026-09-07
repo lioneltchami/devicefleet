@@ -17,7 +17,7 @@ from devicefleet.doctor import run_doctor
 from devicefleet.fleet import DeviceInUseError, Fleet, FleetError
 from devicefleet.models import ActionName, ActionRequest, DeviceListItem, ProviderKind, SessionRecord
 from devicefleet.registry import DeviceNotFoundError
-from devicefleet.sessions import DeviceBusyError, SessionOwnershipError
+from devicefleet.sessions import DeviceBusyError, SessionError, SessionNotFoundError, SessionOwnershipError
 from devicefleet.skilltext import load_skill_markdown
 from devicefleet.store import YamlStore
 from devicefleet.transport.http import HttpTransport
@@ -320,7 +320,7 @@ def session_attach(
     label = _use_agent(ctx, agent)
     try:
         session = _transport(ctx).attach_session(session_id, agent_label=label)
-    except SessionOwnershipError as exc:
+    except (SessionOwnershipError, SessionNotFoundError, SessionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _emit(session.model_dump(mode="json"), True)
@@ -358,6 +358,8 @@ def session_stop(
 ) -> None:
     """Release a session so the device is free again."""
     transport = _transport(ctx)
+    if session_id and session_opt and session_id != session_opt:
+        raise typer.BadParameter("positional session id and --session do not match")
     resolved = session_id or session_opt
     if not resolved:
         if isinstance(transport, HttpTransport):
@@ -370,7 +372,7 @@ def session_stop(
         raise typer.BadParameter("session id required (or start a session first as this agent)")
     try:
         session = transport.stop_session(resolved)
-    except SessionOwnershipError as exc:
+    except (SessionOwnershipError, SessionNotFoundError, SessionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _emit(session.model_dump(mode="json"), True)
@@ -396,10 +398,10 @@ def _resolve_session(ctx: typer.Context, session_id: str | None) -> str:
 
 
 def _run_helper(ctx: typer.Context, request: ActionRequest, session: str | None, as_json: bool) -> None:
-    session_id = _resolve_session(ctx, session)
     try:
+        session_id = _resolve_session(ctx, session)
         result = _transport(ctx).run(session_id, request)
-    except SessionOwnershipError as exc:
+    except (SessionOwnershipError, SessionNotFoundError, SessionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _emit(result.model_dump(mode="json"), True)

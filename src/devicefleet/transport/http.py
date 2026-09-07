@@ -93,7 +93,7 @@ class HttpTransport:
         }
         data = self._request("POST", "/sessions", json=payload)
         session = SessionRecord.model_validate(data)
-        self._remember_secret(session.id, session.secret)
+        self._remember_secret_safe(session.id, session.secret)
         return session
 
     def attach_session(
@@ -103,16 +103,25 @@ class HttpTransport:
         session_secret: str | None = None,
     ) -> SessionRecord:
         label = self._adopt_agent(agent_label)
+        previous = self.session_secrets.get(session_id)
         if session_secret:
-            self._remember_secret(session_id, session_secret)
-        data = self._request(
-            "POST",
-            f"/sessions/{_path_seg(session_id)}/attach",
-            json={"agent_label": label},
-            session_id=session_id,
-        )
+            self.session_secrets[session_id] = session_secret
+        try:
+            data = self._request(
+                "POST",
+                f"/sessions/{_path_seg(session_id)}/attach",
+                json={"agent_label": label},
+                session_id=session_id,
+            )
+        except BaseException:
+            if session_secret:
+                if previous is None:
+                    self.session_secrets.pop(session_id, None)
+                else:
+                    self.session_secrets[session_id] = previous
+            raise
         session = SessionRecord.model_validate(data)
-        self._remember_secret(session.id, session.secret)
+        self._remember_secret_safe(session.id, session.secret)
         return session
 
     def list_sessions(self, active_only: bool = False) -> list[SessionRecord]:
@@ -166,6 +175,13 @@ class HttpTransport:
         if agent_label and agent_label.strip():
             self.agent_label = label
         return label
+
+    def _remember_secret_safe(self, session_id: str, secret: str) -> None:
+        try:
+            self._remember_secret(session_id, secret)
+        except OSError:
+            # In-memory secret is already stored; do not drop a successful lease.
+            return
 
     def _remember_secret(self, session_id: str, secret: str) -> None:
         if not session_id or not secret:

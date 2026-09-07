@@ -231,7 +231,13 @@ class StubCloudProvider(DeviceProvider):
 
     def release_cloud(self, handle: str) -> None:
         def apply(phones: dict[str, _VirtualPhone]) -> None:
-            phone = _require_phone(phones, handle)
+            if not handle or not handle.strip():
+                raise ValueError("device handle is required")
+            phone = phones.get(handle)
+            if phone is None:
+                raise ProviderError(f"stub device not available: {handle}")
+            if phone.released:
+                return
             phone.released = True
             phone.log("released")
 

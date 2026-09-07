@@ -119,13 +119,22 @@ class SessionManager:
         session = self.get(session_id)
         if session.status != SessionStatus.ACTIVE:
             raise SessionError(f"session {session_id} is not active")
+        self.authorize(session, session_secret, agent_label)
+        return session
+
+    def authorize(
+        self,
+        session: SessionRecord,
+        session_secret: str | None,
+        agent_label: str | None = None,
+    ) -> None:
+        """Check the capability secret (and optional owner) on any status."""
         _check_secret(session, session_secret)
         caller = (agent_label or "").strip()
         if caller and caller != session.agent_label:
             raise SessionOwnershipError(
-                f"session {session_id} belongs to {session.agent_label}, not {caller}"
+                f"session {session.id} belongs to {session.agent_label}, not {caller}"
             )
-        return session
 
     def require_owner(self, session_id: str, agent_label: str | None) -> SessionRecord:
         """Return the session only if it is active and owned by this agent.
@@ -210,5 +219,9 @@ def _check_secret(session: SessionRecord, presented: str | None) -> None:
             "session secret is required; it is returned at start/attach "
             "and sent as X-Devicefleet-Session"
         )
-    if not hmac.compare_digest(expected, got):
+    try:
+        matched = hmac.compare_digest(expected.encode("utf-8"), got.encode("utf-8"))
+    except (TypeError, UnicodeError) as exc:
+        raise SessionOwnershipError("invalid session secret") from exc
+    if not matched:
         raise SessionOwnershipError("invalid session secret")

@@ -45,6 +45,8 @@ def test_attach_and_missing(tmp_path: Path) -> None:
         manager.attach(session.id, agent_label="coder")
     with pytest.raises(SessionOwnershipError):
         manager.attach(session.id, agent_label="coder", session_secret="cap_wrong")
+    with pytest.raises(SessionOwnershipError):
+        manager.attach(session.id, agent_label="coder", session_secret="é")
     with pytest.raises(SessionNotFoundError):
         manager.get("ses_missing")
 

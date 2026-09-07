@@ -204,7 +204,7 @@ def test_set_status_does_not_clobber_concurrent_tags(tmp_path: Path) -> None:
     assert loaded.provider_ref == "h1"
 
 
-def test_ensure_stub_demo_repairs_mismatched_record(tmp_path: Path) -> None:
+def test_ensure_stub_demo_does_not_overwrite_existing(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.register(
         "stub-demo",
@@ -212,10 +212,7 @@ def test_ensure_stub_demo_repairs_mismatched_record(tmp_path: Path) -> None:
         "SERIAL-1",
         display_name="Not Stub",
     )
-    repaired = registry.ensure_stub_demo()
-    assert repaired.provider is ProviderKind.STUB
-    assert repaired.provider_ref == "stub-phone-1"
-    assert repaired.display_name == "Stub Demo Phone"
-    loaded = registry.get("stub-demo")
-    assert loaded.provider is ProviderKind.STUB
-    assert loaded.provider_ref == "stub-phone-1"
+    kept = registry.ensure_stub_demo()
+    assert kept.provider is ProviderKind.ADB
+    assert kept.provider_ref == "SERIAL-1"
+    assert kept.display_name == "Not Stub"

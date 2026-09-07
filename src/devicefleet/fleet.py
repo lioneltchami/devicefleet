@@ -180,6 +180,25 @@ class Fleet:
             raise FleetError(
                 "cannot register a CLOUD device until a cloud adapter is configured"
             )
+        if provider is ProviderKind.STUB:
+            with self._provision_lock():
+                return self._register_device_body(
+                    device_id, provider, provider_ref, display_name, tags, metadata, notes
+                )
+        return self._register_device_body(
+            device_id, provider, provider_ref, display_name, tags, metadata, notes
+        )
+
+    def _register_device_body(
+        self,
+        device_id: str,
+        provider: ProviderKind,
+        provider_ref: str,
+        display_name: str | None,
+        tags: list[str] | None,
+        metadata: dict[str, str] | None,
+        notes: str | None,
+    ) -> DeviceRecord:
         ref = provider_ref.strip()
         cleaned = device_id.strip()
         try:
@@ -222,7 +241,7 @@ class Fleet:
                 provider_ref=provider_ref,
                 display_name=display_name,
                 tags=tags,
-                metadata=metadata,
+                metadata=self._user_metadata(metadata),
                 notes=notes,
             )
         except DuplicateDeviceError as exc:
@@ -230,6 +249,13 @@ class Fleet:
         if record.provider is ProviderKind.STUB:
             self.stub.ensure(record.provider_ref, record.display_name)
         return record
+
+    @staticmethod
+    def _user_metadata(metadata: dict[str, str] | None) -> dict[str, str] | None:
+        """Drop lifecycle keys callers must not spoof."""
+        if metadata is None:
+            return None
+        return {key: value for key, value in metadata.items() if key != "provisioned"}
 
     def remove_device(self, device_id: str) -> DeviceRecord:
         """Remove a phone. Refuses if an active session holds it."""
@@ -316,14 +342,13 @@ class Fleet:
         peek = self.sessions.get(session_id)
         with self._lease_lock(peek.device_id):
             current = self.sessions.get(session_id)
+            self.sessions.authorize(current, session_secret, agent_label)
             if current.status is SessionStatus.RELEASED:
                 self._clear_current_session(current.id, current.agent_label)
                 return current
-            self.sessions.require_secret(session_id, session_secret, agent_label)
+            self._release_cloud_handle(current)
             session = self.sessions.stop(session_id)
             self._clear_current_session(session.id, session.agent_label)
-            if current.status is SessionStatus.ACTIVE:
-                self._release_cloud_handle(session)
             return session
 
     def run(
@@ -430,15 +455,22 @@ class Fleet:
             )
             meta = dict(discovered.metadata)
             meta["provisioned"] = "true"
-            return self.registry.register(
-                device_id=discovered.suggested_id or discovered.provider_ref,
-                provider=ProviderKind.STUB,
-                provider_ref=discovered.provider_ref,
-                display_name=discovered.display_name,
-                tags=discovered.suggested_tags,
-                metadata=meta,
-                last_status=DeviceStatus.ONLINE,
-            )
+            try:
+                return self.registry.register(
+                    device_id=discovered.suggested_id or discovered.provider_ref,
+                    provider=ProviderKind.STUB,
+                    provider_ref=discovered.provider_ref,
+                    display_name=discovered.display_name,
+                    tags=discovered.suggested_tags,
+                    metadata=meta,
+                    last_status=DeviceStatus.ONLINE,
+                )
+            except DuplicateDeviceError as exc:
+                try:
+                    self.stub.release_cloud(discovered.provider_ref)
+                except ProviderError:
+                    pass
+                raise FleetError(str(exc)) from exc
 
     def current_session_id(self, agent_label: str | None = None) -> str | None:
         """Return this agent's remembered session, never another agent's."""
@@ -598,10 +630,7 @@ class Fleet:
         provider = self.stub if kind == ProviderKind.STUB.value else self._cloud_provider
         release = getattr(provider, "release_cloud", None) if provider is not None else None
         if callable(release):
-            try:
-                release(handle)
-            except ProviderError:
-                pass
+            release(handle)
         if kind != ProviderKind.STUB.value:
             return
         try:

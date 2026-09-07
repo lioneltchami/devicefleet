@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote
 
+import pytest
 from fastapi.testclient import TestClient
 
 from devicefleet.api.app import create_app
 from devicefleet.fleet import Fleet
 from devicefleet.models import ActionName, ActionRequest
+from devicefleet.store import YamlStore
 from devicefleet.transport.http import HttpTransport, _artifact_basename
 
 
@@ -209,6 +211,21 @@ def test_http_transport_downloads_windows_artifact_path(tmp_path: Path) -> None:
     assert local.name == "screenshot.png"
     assert dest in local.parents
     assert local.read_bytes() == png
+
+
+def test_http_attach_does_not_persist_bad_secret(tmp_path: Path) -> None:
+    store = YamlStore(tmp_path / "state.yaml")
+    transport = HttpTransport("http://test", secret_store=store)
+
+    def boom(method, path, json=None, params=None, session_id=None):  # type: ignore[no-untyped-def]
+        del method, path, json, params, session_id
+        raise RuntimeError("invalid session secret")
+
+    transport._request = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="invalid session secret"):
+        transport.attach_session("ses_bad", session_secret="cap_wrong")
+    assert "ses_bad" not in transport.session_secrets
+    assert store.load().get("session_secrets") in (None, {})
 
 
 def test_duplicate_and_cloud_register(fleet: Fleet) -> None:

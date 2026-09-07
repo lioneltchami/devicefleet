@@ -174,6 +174,7 @@ def create_app(fleet: Fleet | None = None) -> FastAPI:
             SessionOwnershipError,
             DeviceNotFoundError,
             SessionError,
+            ProviderError,
         ) as exc:
             raise _http_error(exc) from exc
         return _public(session)

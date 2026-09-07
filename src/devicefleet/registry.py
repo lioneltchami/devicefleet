@@ -220,16 +220,12 @@ class DeviceRegistry:
         return self._store.update(mutator)
 
     def ensure_stub_demo(self) -> DeviceRecord:
-        """Guarantee a demo device exists so the stub path works offline."""
+        """Create the demo device if missing; never overwrite an existing id."""
         try:
             existing = self.get("stub-demo")
         except DeviceNotFoundError:
             existing = None
-        if (
-            existing is not None
-            and existing.provider is ProviderKind.STUB
-            and existing.provider_ref == "stub-phone-1"
-        ):
+        if existing is not None:
             return existing
         return self.register(
             device_id="stub-demo",

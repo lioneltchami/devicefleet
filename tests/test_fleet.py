@@ -846,6 +846,146 @@ def test_list_devices_skips_removed_during_status_update(fleet: Fleet) -> None:
     t.join()
 
 
+def test_ensure_stub_demo_skips_when_handle_already_taken(fleet: Fleet) -> None:
+    """ensure_stub_demo must not create a stub-demo record when another device
+    already owns stub-phone-1, otherwise two registry ids would lease the same
+    stub phone concurrently.
+    """
+    # Simulate the state the bot describes: stub-demo was removed and a
+    # different id now owns the same provider_ref.
+    fleet.remove_device("stub-demo")
+    fleet.register_device(
+        device_id="custom",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-1",
+        display_name="Custom Demo",
+    )
+    # Now ensure_stub_demo must NOT overwrite "custom" with a fresh stub-demo
+    result = fleet.registry.ensure_stub_demo()
+    assert result is not None
+    assert result.id == "custom", f"got {result.id!r}, expected 'custom'"
+    # The registry must not have a stub-demo record
+    with pytest.raises(DeviceNotFoundError):
+        fleet.registry.get("stub-demo")
+
+
+def test_set_cloud_provider_rejects_replacement_with_active_cloud_session(
+    fleet: Fleet,
+) -> None:
+    """set_cloud_provider must refuse to replace the adapter while a CLOUD
+    session is still active, so the stop path cannot route release_cloud to
+    the wrong adapter.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("slot-1", "Slot 1")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    session = fleet.start_session(device_id="slot-1", agent_label="farm")
+    # Replacing the adapter now must fail
+    new_cloud = FakeCloudProvider()
+    with pytest.raises(ValueError, match="active"):
+        fleet.set_cloud_provider(new_cloud)
+    # Stop the session, then the replacement is allowed
+    fleet.stop_session(session.id, session_secret=session.secret)
+    fleet.set_cloud_provider(new_cloud)  # no error
+
+
+def test_start_session_rolls_back_when_current_session_write_fails(fleet: Fleet) -> None:
+    """If _set_current_session cannot record the new lease, the session must
+    be rolled back to RELEASED so the device is not orphaned.
+    """
+    # Register a second stub device so we can lease it while stub-demo is held
+    fleet.register_device(
+        device_id="racy",
+        provider=ProviderKind.STUB,
+        provider_ref="stub-phone-racy",
+        display_name="Racy",
+    )
+
+    def boom(_session_id: str | None, _agent_label: str) -> None:
+        raise OSError("disk full")
+
+    original = fleet._set_current_session
+    fleet._set_current_session = boom  # type: ignore[method-assign]
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            fleet.start_session(device_id="racy", agent_label="alice")
+    finally:
+        fleet._set_current_session = original  # type: ignore[method-assign]
+
+    # The failed lease must have been rolled back; no active session on racy.
+    assert fleet.sessions.active_for_device("racy") is None
+    sessions = [
+        s for s in fleet.sessions.list_sessions()
+        if s.device_id == "racy"
+    ]
+    assert sessions and sessions[0].status.value == "released"
+
+
+def test_stop_session_retries_pending_release_after_failure(fleet: Fleet) -> None:
+    """A failed _release_cloud_handle must leave a release_pending marker
+    so the next stop_session retry can pick the release back up.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("slot-r", "Slot R")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    session = fleet.start_session(device_id="slot-r", agent_label="farm")
+
+    # First stop: release fails, session is RELEASED but the marker is set
+    cloud.fail_release = True
+    with pytest.raises(ProviderError):
+        fleet.stop_session(session.id, session_secret=session.secret)
+    persisted = fleet.sessions.get(session.id)
+    assert persisted.status.value == "released"
+    assert persisted.metadata.get("release_pending") == "true"
+    assert cloud.released == []
+
+    # Second stop: same id, but the adapter is healthy now; the retry must
+    # clear the marker and actually release the handle.
+    cloud.fail_release = False
+    result = fleet.stop_session(session.id, session_secret=session.secret)
+    assert result.status.value == "released"
+    assert cloud.released == ["slot-r"]
+    cleared = fleet.sessions.get(session.id)
+    assert cleared.metadata.get("release_pending") != "true"
+
+
+def test_stop_session_abandons_pending_release_when_new_lease_exists(
+    fleet: Fleet,
+) -> None:
+    """If a new lease has been started on the same device while a previous
+    release is still pending, the retry must abandon the pending release
+    rather than release a handle the new lease depends on.
+    """
+    cloud = FakeCloudProvider()
+    cloud.add("slot-n", "Slot N")
+    fleet.set_cloud_provider(cloud)
+    fleet.discover(save=True)
+    first = fleet.start_session(device_id="slot-n", agent_label="alice")
+
+    # First stop fails -> release_pending set
+    cloud.fail_release = True
+    with pytest.raises(ProviderError):
+        fleet.stop_session(first.id, session_secret=first.secret)
+
+    # Re-add the cloud phone and start a new session on it
+    cloud.add("slot-n", "Slot N")
+    second = fleet.start_session(device_id="slot-n", agent_label="bob")
+    assert second.id != first.id
+
+    # Retry the original stop: must NOT release slot-n (it now belongs to bob)
+    pre = list(cloud.released)
+    fleet.stop_session(first.id, session_secret=first.secret)
+    assert cloud.released == pre  # no new release
+    cleared = fleet.sessions.get(first.id)
+    assert cleared.metadata.get("release_pending") != "true"  # marker cleared
+
+    # Cleanup
+    cloud.fail_release = False
+    fleet.stop_session(second.id, session_secret=second.secret)
+
+
 def test_clear_current_session_does_not_evict_concurrent_start(fleet: Fleet) -> None:
     """A concurrent start on a *different* device that writes a new id for the
     same agent must not be wiped by a stale _clear_current_session that was

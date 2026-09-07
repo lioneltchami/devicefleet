@@ -230,8 +230,15 @@ class DeviceRegistry:
 
         return self._store.update(mutator)
 
-    def ensure_stub_demo(self) -> DeviceRecord:
-        """Create the demo device if missing; never overwrite an existing id."""
+    def ensure_stub_demo(self) -> DeviceRecord | None:
+        """Create the demo device if missing; never overwrite an existing id.
+
+        If `stub-phone-1` is already registered under a different fleet id
+        (because the user removed `stub-demo` and re-used the handle),
+        skip creation so the demo does not collide with the existing record.
+        Returns the existing `stub-demo` record, the conflicting record when
+        the handle is taken, or the newly created demo.
+        """
         target = DeviceRecord(
             id="stub-demo",
             display_name="Stub Demo Phone",
@@ -245,6 +252,15 @@ class DeviceRegistry:
             devices = self._parse(document)
             for device in devices:
                 if device.id == target.id:
+                    return device
+            # Honor provider-reference uniqueness too. If a different id
+            # already owns `stub-phone-1`, return that record so the caller
+            # can see the conflict rather than silently overwriting it.
+            for device in devices:
+                if (
+                    device.provider is target.provider
+                    and device.provider_ref == target.provider_ref
+                ):
                     return device
             devices.append(target)
             devices.sort(key=lambda item: item.registered_at)

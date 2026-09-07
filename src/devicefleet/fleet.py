@@ -66,6 +66,23 @@ class Fleet:
         # a non-releasing provider can pass a no-op method.
         if not callable(getattr(provider, "release_cloud", None)):
             raise ValueError("cloud provider must implement release_cloud")
+        # Replacing the adapter while a CLOUD session is active would route
+        # `release_cloud` to the wrong adapter on stop (the original
+        # adapter leaks, the new one gets a release for a handle it does
+        # not own). Refuse the replacement; callers must stop active
+        # CLOUD sessions first.
+        if self._cloud_provider is not None:
+            for session in self.sessions.list_sessions(active_only=True):
+                try:
+                    device = self.registry.get(session.device_id)
+                except DeviceNotFoundError:
+                    continue
+                if device.provider is ProviderKind.CLOUD:
+                    raise ValueError(
+                        f"cannot replace cloud provider while CLOUD session "
+                        f"{session.id} on {session.device_id} is active; "
+                        "stop the session first"
+                    )
         self._cloud_provider = provider
 
     def provider_for(self, kind: ProviderKind) -> DeviceProvider:
@@ -328,7 +345,18 @@ class Fleet:
                 except DeviceBusyError:
                     seen_busy = True
                     continue
-                self._set_current_session(session.id, label)
+                # If we cannot record the current-session mapping, the lease
+                # would be orphaned: future CLI commands could not find the
+                # session, but the device would still be held. Roll back the
+                # session so the device is free for retry.
+                try:
+                    self._set_current_session(session.id, label)
+                except Exception:
+                    try:
+                        self.sessions.stop(session.id)
+                    except Exception:
+                        pass
+                    raise
                 return session
 
     def attach_session(
@@ -356,28 +384,58 @@ class Fleet:
             current = self.sessions.get(session_id)
             self.sessions.authorize(current, session_secret, agent_label)
             if current.status is SessionStatus.RELEASED:
-                # Idempotent retry: the cloud handle is owned by whatever lease
-                # now exists for the device. Do not touch it.
+                # Idempotent retry: attempt any pending cloud release first
+                # so a transient provider failure does not become a permanent
+                # hosted-handle leak. Bail out if a *new* lease now owns the
+                # device, so we do not release a handle that belongs to it.
+                self._retry_pending_release(current)
                 self._clear_current_session(current.id, current.agent_label)
                 return current
             # Mark RELEASED first so the persistent state is the source of
             # truth. If the cloud release then fails, the session is already
-            # RELEASED; a retry becomes a no-op and the only consequence is
-            # that the hosted handle leaks (the operator must reconcile the
-            # farm). The previous "release first" order left the session
-            # ACTIVE with no handle, breaking actions and double-releasing.
+            # RELEASED; a subsequent stop_session retry will see the
+            # `release_pending` marker and try again.
             result = self.sessions.stop(session_id)
             try:
                 self._release_cloud_handle(result.session)
             except Exception:
-                # The persistent state is already consistent; surface the
-                # release failure but keep the RELEASED transition.
+                # The session is RELEASED but the handle is still held.
+                # Mark the session so the next stop_session retry can pick
+                # the release back up, then surface the failure.
+                self.sessions.set_release_pending(session_id, pending=True)
                 self._clear_current_session(
                     result.session.id, result.session.agent_label
                 )
                 raise
+            self.sessions.set_release_pending(session_id, pending=False)
             self._clear_current_session(result.session.id, result.session.agent_label)
             return result.session
+
+    def _retry_pending_release(self, session: SessionRecord) -> None:
+        """Re-attempt the cloud-handle release for a session that was RELEASED
+        but whose previous release attempt failed. Skip the release if a new
+        lease now owns the same device+handle so we do not stomp on it.
+        """
+        if session.metadata.get("release_pending") != "true":
+            return
+        handle = (session.metadata.get("provider_ref") or "").strip()
+        kind = (session.metadata.get("provider") or "").strip()
+        if not handle:
+            self.sessions.set_release_pending(session.id, pending=False)
+            return
+        active = self.sessions.active_for_device(session.device_id)
+        if active is not None and active.id != session.id:
+            # A new lease now owns the device. The old handle may or may not
+            # still be ours; releasing through the new adapter could free a
+            # handle the new lease depends on. Abandon the pending release.
+            self.sessions.set_release_pending(session.id, pending=False)
+            return
+        try:
+            self._release_cloud_handle(session)
+        except Exception:
+            # Leave the marker in place; another retry may succeed.
+            return
+        self.sessions.set_release_pending(session.id, pending=False)
 
     def run(
         self,

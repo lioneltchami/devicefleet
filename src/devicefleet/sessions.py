@@ -229,6 +229,37 @@ class SessionManager:
 
         return self._store.update(mutator)
 
+    def set_release_pending(self, session_id: str, pending: bool) -> SessionRecord:
+        """Mark or clear a pending cloud-handle release for a session.
+
+        When `pending` is True, the session is in RELEASED status but the
+        hosted handle has not yet been released; subsequent stop_session
+        retries should re-attempt the release. When False, the release is
+        complete (or was never needed).
+        """
+        def mutator(document: dict[str, object]) -> SessionRecord:
+            sessions = self._parse(document)
+            found: SessionRecord | None = None
+            for item in sessions:
+                if item.id == session_id:
+                    found = item
+                    break
+            if found is None:
+                raise SessionNotFoundError(f"session not found: {session_id}")
+            metadata = dict(found.metadata)
+            if pending:
+                metadata["release_pending"] = "true"
+            else:
+                metadata.pop("release_pending", None)
+            updated = found.model_copy(update={"metadata": metadata})
+            replaced = [item for item in sessions if item.id != session_id]
+            replaced.append(updated)
+            document.clear()
+            document.update(self._dump(replaced))
+            return updated
+
+        return self._store.update(mutator)
+
 
 def _new_session_id() -> str:
     return "ses_" + secrets.token_hex(6)

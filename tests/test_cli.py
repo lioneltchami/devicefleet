@@ -16,6 +16,12 @@ def test_help() -> None:
     assert "session" in result.stdout
 
 
+def test_version() -> None:
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert "0.1.0" in result.stdout
+
+
 def test_doctor_and_stub_flow(tmp_path: Path) -> None:
     home = str(tmp_path / "home")
     doctor = runner.invoke(app, ["--home", home, "doctor"])

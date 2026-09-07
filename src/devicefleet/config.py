@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     def artifacts_dir(self) -> Path:
         return self.home / "artifacts"
 
+    @property
+    def stub_state_path(self) -> Path:
+        return self.home / "stub-state.yaml"
+
     def ensure_dirs(self) -> None:
         """Create the data directory tree if it does not exist."""
         self.home.mkdir(parents=True, exist_ok=True)

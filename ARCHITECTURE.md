@@ -45,6 +45,7 @@ State lives under `$DEVICEFLEET_HOME` (default `~/.devicefleet`):
 - `devices.yaml` — registered phones
 - `sessions.yaml` — leases
 - `state.yaml` — current session id for the local CLI
+- `stub-state.yaml` — virtual phone state so CLI commands share one stub
 - `artifacts/<session>/` — screenshots and UI dumps
 
 ## Why sessions are first-class

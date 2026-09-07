@@ -68,6 +68,12 @@ def _emit(data: object, as_json: bool) -> None:
         console.print(data)
 
 
+def _version_flag(value: bool) -> None:
+    if value:
+        console.print(__version__)
+        raise typer.Exit()
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -81,12 +87,15 @@ def main(
     ] = None,
     version: Annotated[
         bool,
-        typer.Option("--version", help="Print the package version and exit."),
+        typer.Option(
+            "--version",
+            help="Print the package version and exit.",
+            callback=_version_flag,
+            is_eager=True,
+        ),
     ] = False,
 ) -> None:
-    if version:
-        console.print(__version__)
-        raise typer.Exit()
+    del version
     ctx.obj = {"settings": _settings(home), "remote_url": remote, "fleet": None}
 
 
@@ -107,11 +116,11 @@ def doctor(
     if report.devices:
         console.print("\n[bold]Registered[/bold]")
         for line in report.devices:
-            console.print(f"  {line}")
+            console.print(f"  {line}", markup=False)
     if report.adb_serials:
         console.print("\n[bold]adb serials[/bold]")
         for serial in report.adb_serials:
-            console.print(f"  {serial}")
+            console.print(f"  {serial}", markup=False)
     if not report.ok:
         raise typer.Exit(code=1)
 

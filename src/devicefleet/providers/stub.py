@@ -1,12 +1,14 @@
-"""In-memory hosted phone used for demos and tests. No credentials required."""
+"""Hosted phone simulator for demos and tests. No credentials required."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from devicefleet.models import CloudDeviceSpec, DeviceStatus, DiscoveredDevice, ProviderKind
 from devicefleet.pngutil import solid_png
 from devicefleet.providers.base import CloudDeviceProvider, DeviceProvider, ProviderError
+from devicefleet.store import YamlStore
 
 DEFAULT_WIDTH = 1080
 DEFAULT_HEIGHT = 1920
@@ -30,23 +32,29 @@ class _VirtualPhone:
         self.actions.append(message)
 
 
+def _default_phones() -> dict[str, _VirtualPhone]:
+    return {
+        DEFAULT_HANDLE: _VirtualPhone(
+            handle=DEFAULT_HANDLE,
+            display_name="Stub Demo Phone",
+        )
+    }
+
+
 class StubCloudProvider(DeviceProvider):
     """Reference CloudDeviceProvider: a fake Android that records actions.
 
     Use this when you have no USB phone and no paid device-farm account.
-    Production farms should copy the method signatures, not this in-memory
-    implementation.
+    Production farms should copy the method signatures, not this
+    implementation. State is optionally persisted so CLI processes share one
+    virtual phone.
     """
 
     provider_id = "stub"
 
-    def __init__(self) -> None:
-        self._phones: dict[str, _VirtualPhone] = {
-            DEFAULT_HANDLE: _VirtualPhone(
-                handle=DEFAULT_HANDLE,
-                display_name="Stub Demo Phone",
-            )
-        }
+    def __init__(self, state_path: Path | None = None) -> None:
+        self._store = YamlStore(state_path) if state_path is not None else None
+        self._phones: dict[str, _VirtualPhone] = _load_phones(self._store)
 
     def discover(self) -> list[DiscoveredDevice]:
         return [
@@ -58,6 +66,7 @@ class StubCloudProvider(DeviceProvider):
     def screenshot(self, handle: str) -> bytes:
         phone = self._require(handle)
         phone.log("screenshot")
+        self._persist()
         return solid_png(
             phone.width,
             phone.height,
@@ -70,6 +79,7 @@ class StubCloudProvider(DeviceProvider):
         self._in_bounds(phone, x, y)
         phone.last_tap = (x, y)
         phone.log(f"tap {x},{y}")
+        self._persist()
 
     def swipe(
         self,
@@ -87,6 +97,7 @@ class StubCloudProvider(DeviceProvider):
             raise ValueError("duration_ms must be >= 1")
         phone.last_tap = (x2, y2)
         phone.log(f"swipe {x1},{y1}->{x2},{y2} {duration_ms}ms")
+        self._persist()
 
     def type_text(self, handle: str, text: str) -> None:
         if text is None:
@@ -94,6 +105,7 @@ class StubCloudProvider(DeviceProvider):
         phone = self._require(handle)
         phone.last_text += text
         phone.log(f"type {text!r}")
+        self._persist()
 
     def keyevent(self, handle: str, key: str) -> None:
         if not key or not str(key).strip():
@@ -105,10 +117,12 @@ class StubCloudProvider(DeviceProvider):
         elif phone.last_key == "BACK":
             phone.focused = "previous"
         phone.log(f"key {phone.last_key}")
+        self._persist()
 
     def dump_ui(self, handle: str) -> str:
         phone = self._require(handle)
         phone.log("dump_ui")
+        self._persist()
         tap = phone.last_tap or (0, 0)
         return (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -144,12 +158,14 @@ class StubCloudProvider(DeviceProvider):
         phone = _VirtualPhone(handle=handle, display_name=name)
         self._phones[handle] = phone
         phone.log(f"provisioned platform={spec.platform}")
+        self._persist()
         return self._as_discovered(phone, tags=list(spec.tags))
 
     def release_cloud(self, handle: str) -> None:
         phone = self._require(handle)
         phone.released = True
         phone.log("released")
+        self._persist()
 
     def health(self, handle: str) -> bool:
         phone = self._phones.get(handle)
@@ -176,6 +192,14 @@ class StubCloudProvider(DeviceProvider):
                 f"point ({x},{y}) is outside {phone.width}x{phone.height}"
             )
 
+    def _persist(self) -> None:
+        if self._store is None:
+            return
+        payload: dict[str, object] = {
+            "phones": [_phone_to_dict(phone) for phone in self._phones.values()]
+        }
+        self._store.save(payload)
+
     @staticmethod
     def _as_discovered(
         phone: _VirtualPhone, tags: list[str] | None = None
@@ -193,6 +217,58 @@ class StubCloudProvider(DeviceProvider):
             suggested_id="stub-demo" if phone.handle == DEFAULT_HANDLE else phone.handle,
             suggested_tags=tags or ["demo", "stub", "android"],
         )
+
+
+def _phone_to_dict(phone: _VirtualPhone) -> dict[str, object]:
+    return {
+        "handle": phone.handle,
+        "display_name": phone.display_name,
+        "width": phone.width,
+        "height": phone.height,
+        "last_tap": list(phone.last_tap) if phone.last_tap else None,
+        "last_text": phone.last_text,
+        "last_key": phone.last_key,
+        "released": phone.released,
+        "actions": list(phone.actions),
+        "focused": phone.focused,
+    }
+
+
+def _phone_from_dict(raw: dict[str, object]) -> _VirtualPhone:
+    tap_raw = raw.get("last_tap")
+    last_tap: tuple[int, int] | None = None
+    if isinstance(tap_raw, list) and len(tap_raw) == 2:
+        last_tap = (int(tap_raw[0]), int(tap_raw[1]))
+    actions_raw = raw.get("actions") or []
+    actions = [str(item) for item in actions_raw] if isinstance(actions_raw, list) else []
+    return _VirtualPhone(
+        handle=str(raw.get("handle") or DEFAULT_HANDLE),
+        display_name=str(raw.get("display_name") or "Stub Demo Phone"),
+        width=int(raw.get("width") or DEFAULT_WIDTH),
+        height=int(raw.get("height") or DEFAULT_HEIGHT),
+        last_tap=last_tap,
+        last_text=str(raw.get("last_text") or ""),
+        last_key=str(raw.get("last_key") or ""),
+        released=bool(raw.get("released")),
+        actions=actions,
+        focused=str(raw.get("focused") or "home"),
+    )
+
+
+def _load_phones(store: YamlStore | None) -> dict[str, _VirtualPhone]:
+    if store is None:
+        return _default_phones()
+    document = store.load()
+    raw_phones = document.get("phones")
+    if not isinstance(raw_phones, list) or not raw_phones:
+        return _default_phones()
+    phones: dict[str, _VirtualPhone] = {}
+    for item in raw_phones:
+        if not isinstance(item, dict):
+            continue
+        phone = _phone_from_dict(item)
+        phones[phone.handle] = phone
+    return phones or _default_phones()
 
 
 # Runtime check: the stub is a valid CloudDeviceProvider.

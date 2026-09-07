@@ -31,6 +31,16 @@ def test_screenshot_tap_and_dump() -> None:
     assert info["last_tap"] == "300,400"
 
 
+def test_state_survives_reload(tmp_path) -> None:
+    path = tmp_path / "stub-state.yaml"
+    first = StubCloudProvider(state_path=path)
+    first.tap("stub-phone-1", 111, 222)
+    second = StubCloudProvider(state_path=path)
+    assert second.describe("stub-phone-1")["last_tap"] == "111,222"
+    xml = second.dump_ui("stub-phone-1")
+    assert "[111,222]" in xml
+
+
 def test_provision_and_release() -> None:
     provider = StubCloudProvider()
     extra = provider.provision(CloudDeviceSpec(model="Farm Pixel"))

@@ -47,7 +47,7 @@ class Fleet:
             adb_bin=self.settings.adb_bin,
             timeout_s=self.settings.adb_timeout_s,
         )
-        self.stub = StubCloudProvider()
+        self.stub = StubCloudProvider(state_path=self.settings.stub_state_path)
         self.registry.ensure_stub_demo()
 
     def provider_for(self, kind: ProviderKind) -> DeviceProvider:
